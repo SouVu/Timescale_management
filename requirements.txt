@@ -1,9 +1,4 @@
-# Web Interface & Data Handling
-streamlit==1.31.0
-pandas==2.2.0
-
-# Database Connectivity (PostgreSQL)
-psycopg2-binary==2.9.9
-
-# Optional: Visualization (if we add the topology map later)
-graphviz==0.20.1
+streamlit
+pandas
+psycopg[binary]
+graphviz
