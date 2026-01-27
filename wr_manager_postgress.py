@@ -15,7 +15,7 @@ def init_db():
             # 1. Projects
             cur.execute("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, name TEXT UNIQUE)")
             
-            # 2. Switches (Added clock_source)
+            # 2. Switches
             cur.execute("""CREATE TABLE IF NOT EXISTS switches (
                 id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id), 
                 name TEXT UNIQUE, role TEXT, ip_address TEXT, mac TEXT, 
@@ -28,26 +28,24 @@ def init_db():
                 alpha FLOAT DEFAULT 0, delta_tx FLOAT DEFAULT 0, delta_rx FLOAT DEFAULT 0, 
                 remarks TEXT)""")
             
-            # 4. Ports (Added remote_sfp_id)
+            # 4. Ports (Stores topology AND Port-specific electronics delays)
             cur.execute("""CREATE TABLE IF NOT EXISTS ports (
                 id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id),
                 switch_id INTEGER REFERENCES switches(id), port_num INTEGER, 
                 sfp_id INTEGER REFERENCES sfps(id),
                 remote_sfp_id INTEGER REFERENCES sfps(id),
-                connected_to_id INTEGER REFERENCES switches(id), connected_port_num INTEGER)""")
+                connected_to_id INTEGER REFERENCES switches(id), connected_port_num INTEGER,
+                port_delta_tx FLOAT DEFAULT 0, port_delta_rx FLOAT DEFAULT 0)""")
             
-            # --- MIGRATIONS (Auto-Update Existing DB) ---
-            cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS mac TEXT")
-            cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS ip_address TEXT")
-            cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS clock_source TEXT") # <--- NEW
-            
-            cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS channel TEXT")
+            # --- MIGRATIONS ---
+            # Ensure columns exist if updating from old DB
+            cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS clock_source TEXT")
             cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS delta_tx FLOAT DEFAULT 0")
             cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS delta_rx FLOAT DEFAULT 0")
             cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS remarks TEXT")
-            
-            cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS connected_port_num INTEGER")
-            cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS remote_sfp_id INTEGER") # <--- NEW
+            cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS remote_sfp_id INTEGER")
+            cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS port_delta_tx FLOAT DEFAULT 0")
+            cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS port_delta_rx FLOAT DEFAULT 0")
         conn.commit()
 
 # --- APP SETUP ---
@@ -70,61 +68,45 @@ if all_projects.empty:
 selected_project = st.sidebar.selectbox("Active Network", all_projects['name'])
 p_id = int(all_projects[all_projects['name'] == selected_project]['id'].values[0])
 
-# Delete Network Feature
 st.sidebar.divider()
-with st.sidebar.expander("❌ Delete Entire Network"):
-    st.write(f"WARNING: This deletes **{selected_project}** and ALL data.")
-    confirm_name = st.text_input("Type network name to confirm:")
-    if st.button("DELETE PROJECT NOW"):
-        if confirm_name == selected_project:
-            with get_conn() as conn:
-                conn.execute("DELETE FROM ports WHERE project_id=%s", (p_id,))
-                conn.execute("DELETE FROM sfps WHERE project_id=%s", (p_id,))
-                conn.execute("DELETE FROM switches WHERE project_id=%s", (p_id,))
-                conn.execute("DELETE FROM projects WHERE id=%s", (p_id,))
-            st.rerun()
-        else:
-            st.error("Name mismatch.")
+with st.sidebar.expander("❌ Delete Project"):
+    if st.button("DELETE PROJECT"):
+        with get_conn() as conn:
+            conn.execute("DELETE FROM ports WHERE project_id=%s", (p_id,))
+            conn.execute("DELETE FROM sfps WHERE project_id=%s", (p_id,))
+            conn.execute("DELETE FROM switches WHERE project_id=%s", (p_id,))
+            conn.execute("DELETE FROM projects WHERE id=%s", (p_id,))
+        st.rerun()
 
-# --- MAIN TABS ---
+# --- TABS ---
 st.title(f"🐇 {selected_project} Dashboard")
 tabs = st.tabs(["🗺️ Map", "🖥️ Switches", "🔌 SFPs", "⚙️ Connections", "💾 Backup", "📐 Calc"])
 
 # --- TAB 1: SWITCHES ---
 with tabs[1]:
-    st.subheader("Manage Switches")
+    st.subheader("Switches")
     with get_conn() as conn: 
         df_sw = pd.read_sql(f"SELECT * FROM switches WHERE project_id={p_id} ORDER BY name", conn)
     st.dataframe(df_sw, use_container_width=True)
 
-    st.info("💡 To **EDIT** a switch, type its Name below and change the values. It will update automatically.")
     with st.form("sw_form"):
         st.write("**Add / Update Switch**")
         c1, c2, c3 = st.columns(3)
-        sw_name = c1.text_input("Hostname (Required)", placeholder="e.g. WRS-1")
-        sw_ip = c2.text_input("IP Address")
-        sw_mac = c3.text_input("MAC Address")
-        
+        sw_name = c1.text_input("Name", placeholder="e.g. WRS-1")
+        sw_ip = c2.text_input("IP")
+        sw_mac = c3.text_input("MAC")
         c4, c5 = st.columns(2)
-        # Added "Timescale Slave" to the list
         sw_role = c4.selectbox("Role", ["Grandmaster", "Boundary", "Slave", "Timescale Slave"])
-        sw_clk = c5.text_input("Clock Source", placeholder="e.g. GPS, Atomic, Internal") # <--- NEW FIELD
+        sw_clk = c5.text_input("Clock Source")
 
-        if st.form_submit_button("Save / Update Switch"):
+        if st.form_submit_button("Save Switch"):
             if sw_name:
                 with get_conn() as conn:
                     conn.execute("""INSERT INTO switches (project_id, name, ip_address, mac, role, clock_source) 
                                  VALUES (%s, %s, %s, %s, %s, %s) 
-                                 ON CONFLICT (name) DO UPDATE SET 
-                                    ip_address=EXCLUDED.ip_address, 
-                                    mac=EXCLUDED.mac, 
-                                    role=EXCLUDED.role,
-                                    clock_source=EXCLUDED.clock_source""", 
+                                 ON CONFLICT (name) DO UPDATE SET ip_address=EXCLUDED.ip_address, mac=EXCLUDED.mac, role=EXCLUDED.role, clock_source=EXCLUDED.clock_source""", 
                                  (p_id, sw_name, sw_ip, sw_mac, sw_role, sw_clk))
-                st.success(f"Saved {sw_name}")
                 st.rerun()
-            else:
-                st.error("Hostname is required.")
 
     with st.expander("🗑️ Delete Switch"):
         if not df_sw.empty:
@@ -138,40 +120,31 @@ with tabs[1]:
 
 # --- TAB 2: SFPs ---
 with tabs[2]:
-    st.subheader("SFP Inventory")
+    st.subheader("SFPs")
     with get_conn() as conn:
         df_sfp = pd.read_sql(f"SELECT * FROM sfps WHERE project_id={p_id} ORDER BY serial", conn)
     st.dataframe(df_sfp, use_container_width=True)
 
-    st.info("💡 To **EDIT** an SFP (e.g. update Delta Tx), just type the Serial Number and the new values.")
     with st.form("sfp_form"):
-        # Row 1
+        st.write("**Add / Update SFP**")
         c1, c2, c3, c4 = st.columns(4)
-        sn = c1.text_input("Serial Number (Required)")
-        ch = c2.text_input("Channel (e.g. C34)")
-        wv = c3.text_input("Wavelength (nm)")
+        sn = c1.text_input("Serial Number")
+        ch = c2.text_input("Channel")
+        wv = c3.text_input("Wavelength")
         al = c4.number_input("Alpha", value=0.0, format="%.6f")
-        
-        # Row 2
         c5, c6, c7 = st.columns(3)
-        dtx = c5.number_input("Delta Tx (ns)", value=0.0, format="%.4f")
-        drx = c6.number_input("Delta Rx (ns)", value=0.0, format="%.4f")
+        dtx = c5.number_input("SFP Delta Tx", value=0.0, format="%.4f")
+        drx = c6.number_input("SFP Delta Rx", value=0.0, format="%.4f")
         rem = c7.text_input("Remarks")
 
-        if st.form_submit_button("Save / Update SFP"):
+        if st.form_submit_button("Save SFP"):
             if sn:
                 with get_conn() as conn:
                     conn.execute("""INSERT INTO sfps (project_id, serial, channel, wavelength, alpha, delta_tx, delta_rx, remarks) 
                                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
-                                 ON CONFLICT (serial) DO UPDATE SET 
-                                    channel=EXCLUDED.channel, wavelength=EXCLUDED.wavelength, 
-                                    alpha=EXCLUDED.alpha, delta_tx=EXCLUDED.delta_tx, 
-                                    delta_rx=EXCLUDED.delta_rx, remarks=EXCLUDED.remarks""", 
+                                 ON CONFLICT (serial) DO UPDATE SET channel=EXCLUDED.channel, wavelength=EXCLUDED.wavelength, alpha=EXCLUDED.alpha, delta_tx=EXCLUDED.delta_tx, delta_rx=EXCLUDED.delta_rx, remarks=EXCLUDED.remarks""", 
                                  (p_id, sn, ch, wv, al, dtx, drx, rem))
-                st.success(f"Updated SFP {sn}")
                 st.rerun()
-            else:
-                st.error("Serial Number is required.")
 
     with st.expander("🗑️ Delete SFP"):
         if not df_sfp.empty:
@@ -179,21 +152,21 @@ with tabs[2]:
             if st.button("Confirm Delete SFP"):
                 with get_conn() as conn:
                     sid = int(df_sfp[df_sfp['serial']==del_sfp]['id'].values[0])
-                    conn.execute("UPDATE ports SET sfp_id=NULL WHERE sfp_id=%s", (sid,)) # Unlink first
-                    conn.execute("UPDATE ports SET remote_sfp_id=NULL WHERE remote_sfp_id=%s", (sid,)) # Unlink remote
+                    conn.execute("UPDATE ports SET sfp_id=NULL WHERE sfp_id=%s", (sid,))
+                    conn.execute("UPDATE ports SET remote_sfp_id=NULL WHERE remote_sfp_id=%s", (sid,))
                     conn.execute("DELETE FROM sfps WHERE id=%s", (sid,))
                 st.rerun()
 
-# --- TAB 3: CONNECTIONS (DUAL SFPs) ---
+# --- TAB 3: CONNECTIONS (ADDED PORT DELTAS) ---
 with tabs[3]:
-    st.subheader("Port Links")
+    st.subheader("Connections")
     with get_conn() as conn:
-        # Complex join to show both SFPs
         df_p = pd.read_sql(f"""
-            SELECT p.id, s1.name as local_switch, p.port_num, 
-                   sfp1.serial as local_sfp,
-                   s2.name as remote_switch, p.connected_port_num,
-                   sfp2.serial as remote_sfp
+            SELECT p.id, s1.name as local, p.port_num, 
+                   sfp1.serial as l_sfp,
+                   s2.name as remote, p.connected_port_num,
+                   sfp2.serial as r_sfp,
+                   p.port_delta_tx, p.port_delta_rx
             FROM ports p 
             JOIN switches s1 ON p.switch_id=s1.id 
             LEFT JOIN switches s2 ON p.connected_to_id=s2.id 
@@ -209,25 +182,29 @@ with tabs[3]:
     if mode == "Add New Link":
         with st.form("link_form"):
             st.write("**New Connection**")
-            
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             # Safe Lists
             sw_opts = df_sw['name'].tolist() if not df_sw.empty else []
             sfp_opts = ["None"] + df_sfp['serial'].tolist() if not df_sfp.empty else ["None"]
             
-            # Local Side
-            l_sw = c1.selectbox("Local Switch", sw_opts, key="l_sw")
-            l_p = c1.number_input("Local Port", 1, 52, key="l_p")
-            l_sfp = c1.selectbox("Local SFP", sfp_opts, key="l_sfp")
+            l_sw = c1.selectbox("Local Switch", sw_opts)
+            l_p = c1.number_input("Local Port", 1, 52)
+            l_sfp = c1.selectbox("Local SFP", sfp_opts)
             
-            # Remote Side
-            r_sw = c2.selectbox("Remote Switch", ["None"] + sw_opts, key="r_sw")
-            r_p = c2.number_input("Remote Port", 1, 52, key="r_p")
-            r_sfp = c2.selectbox("Remote SFP", sfp_opts, key="r_sfp")
+            # Port Electronics Delays
+            st.write("**Local Port Electronics Calibration**")
+            cd1, cd2 = st.columns(2)
+            p_dtx = cd1.number_input("Port Delta Tx (ns)", 0.0, format="%.4f")
+            p_drx = cd2.number_input("Port Delta Rx (ns)", 0.0, format="%.4f")
+
+            st.divider() # Visual separator
+            c4, c5, c6 = st.columns(3)
+            r_sw = c4.selectbox("Remote Switch", ["None"] + sw_opts)
+            r_p = c5.number_input("Remote Port", 1, 52)
+            r_sfp = c6.selectbox("Remote SFP", sfp_opts)
             
             if st.form_submit_button("Create Link"):
                 if not df_sw.empty and l_sw:
-                    # Get IDs
                     lid = int(df_sw[df_sw['name']==l_sw]['id'].values[0])
                     rid = int(df_sw[df_sw['name']==r_sw]['id'].values[0]) if r_sw != "None" else None
                     sid1 = int(df_sfp[df_sfp['serial']==l_sfp]['id'].values[0]) if l_sfp != "None" else None
@@ -235,50 +212,37 @@ with tabs[3]:
                     
                     with get_conn() as conn:
                         conn.execute("""INSERT INTO ports 
-                            (project_id, switch_id, port_num, sfp_id, connected_to_id, connected_port_num, remote_sfp_id) 
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)""", 
-                            (p_id, lid, l_p, sid1, rid, r_p, sid2))
-                    st.success("Link Created")
+                            (project_id, switch_id, port_num, sfp_id, remote_sfp_id, connected_to_id, connected_port_num, port_delta_tx, port_delta_rx) 
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""", 
+                            (p_id, lid, l_p, sid1, sid2, rid, r_p, p_dtx, p_drx))
                     st.rerun()
-                else:
-                    st.error("No switches available.")
 
     elif mode == "Edit Existing Link":
-        if df_p.empty:
-            st.info("No links found.")
-        else:
-            link_lbls = df_p.apply(lambda x: f"ID {x['id']}: {x['local_switch']} P{x['port_num']} -> {x['remote_switch']}", axis=1)
-            sel_lbl = st.selectbox("Select Link to Edit", link_lbls)
-            sel_id = int(sel_lbl.split(":")[0].replace("ID ", ""))
+        if not df_p.empty:
+            lbls = df_p.apply(lambda x: f"ID {x['id']}: {x['local']} P{x['port_num']} -> {x['remote']}", axis=1)
+            sel = st.selectbox("Select Link", lbls)
+            sel_id = int(sel.split(":")[0].replace("ID ", ""))
             
             with st.form("edit_link"):
-                st.write(f"Editing {sel_lbl}")
-                # We only allow editing the destination/SFPs to keep it simple
-                c1, c2 = st.columns(2)
-                sw_opts = df_sw['name'].tolist()
+                st.write(f"Editing {sel}")
+                # For simplicity in edit mode, we allow updating the Deltas and Remote info
+                ce1, ce2 = st.columns(2)
+                n_p_dtx = ce1.number_input("Update Port Delta Tx", 0.0, format="%.4f")
+                n_p_drx = ce2.number_input("Update Port Delta Rx", 0.0, format="%.4f")
+                
                 sfp_opts = ["None"] + df_sfp['serial'].tolist()
-                
-                new_r_sw = c1.selectbox("New Remote Switch", ["None"] + sw_opts)
-                new_r_p = c1.number_input("New Remote Port", 1, 52)
-                
-                new_l_sfp = c2.selectbox("New Local SFP", sfp_opts)
-                new_r_sfp = c2.selectbox("New Remote SFP", sfp_opts)
+                n_lsfp = st.selectbox("Update Local SFP", sfp_opts)
                 
                 if st.form_submit_button("Update Link"):
-                    rid = int(df_sw[df_sw['name']==new_r_sw]['id'].values[0]) if new_r_sw != "None" else None
-                    sid1 = int(df_sfp[df_sfp['serial']==new_l_sfp]['id'].values[0]) if new_l_sfp != "None" else None
-                    sid2 = int(df_sfp[df_sfp['serial']==new_r_sfp]['id'].values[0]) if new_r_sfp != "None" else None
-                    
+                    sid1 = int(df_sfp[df_sfp['serial']==n_lsfp]['id'].values[0]) if n_lsfp != "None" else None
                     with get_conn() as conn:
-                        conn.execute("""UPDATE ports SET 
-                            connected_to_id=%s, connected_port_num=%s, sfp_id=%s, remote_sfp_id=%s
-                            WHERE id=%s""", (rid, new_r_p, sid1, sid2, sel_id))
-                    st.success("Link Updated")
+                        conn.execute("""UPDATE ports SET port_delta_tx=%s, port_delta_rx=%s, sfp_id=%s WHERE id=%s""", 
+                                     (n_p_dtx, n_p_drx, sid1, sel_id))
                     st.rerun()
 
     with st.expander("🗑️ Delete Link"):
         if not df_p.empty:
-            d_lbl = st.selectbox("Remove Link", df_p.apply(lambda x: f"ID {x['id']}: {x['local_switch']} P{x['port_num']}", axis=1))
+            d_lbl = st.selectbox("Remove Link", df_p.apply(lambda x: f"ID {x['id']}: {x['local']} P{x['port_num']}", axis=1))
             if st.button("Delete Selected Link"):
                 lid_del = int(d_lbl.split(":")[0].replace("ID ", ""))
                 with get_conn() as conn: conn.execute("DELETE FROM ports WHERE id=%s", (lid_del,))
@@ -286,15 +250,15 @@ with tabs[3]:
 
 # --- TAB 4: BACKUP ---
 with tabs[4]:
-    st.subheader("💾 Backup & Export")
-    if st.button("📦 Generate Backup ZIP"):
+    st.subheader("Backup")
+    if st.button("📦 Generate ZIP"):
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
             with get_conn() as conn:
                 zf.writestr("switches.csv", pd.read_sql(f"SELECT * FROM switches WHERE project_id={p_id}", conn).to_csv(index=False))
                 zf.writestr("sfps.csv", pd.read_sql(f"SELECT * FROM sfps WHERE project_id={p_id}", conn).to_csv(index=False))
                 zf.writestr("ports.csv", pd.read_sql(f"SELECT * FROM ports WHERE project_id={p_id}", conn).to_csv(index=False))
-        st.download_button("⬇️ Download ZIP", zip_buffer.getvalue(), f"WR_Backup.zip", "application/zip")
+        st.download_button("⬇️ Download", zip_buffer.getvalue(), f"WR_Backup.zip", "application/zip")
 
 # --- TAB 0: MAP ---
 with tabs[0]:
@@ -304,11 +268,11 @@ with tabs[0]:
         dot = Digraph(format='pdf')
         dot.attr(rankdir='LR')
         for _, s in df_sw.iterrows():
-            dot.node(str(s['id']), f"{s['name']}\n{s['role']}\n{s['ip_address']}\n{s['mac']}")
+            dot.node(str(s['id']), f"{s['name']}\n{s['role']}\n{s['ip_address']}")
         for _, l in links.iterrows():
             dot.edge(str(l['switch_id']), str(l['connected_to_id']), label=f"P{l['port_num']}:P{l['connected_port_num']}")
         st.graphviz_chart(dot)
-        try: st.download_button("📥 PDF Map", dot.pipe(), "topology.pdf")
+        try: st.download_button("📥 PDF", dot.pipe(), "topology.pdf")
         except: pass
 
 # --- TAB 5: CALC ---
