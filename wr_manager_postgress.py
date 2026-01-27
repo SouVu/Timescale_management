@@ -1,227 +1,157 @@
 import streamlit as st
 import pandas as pd
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from graphviz import Digraph
 
-# --- CONFIGURATION ---
-# ideally, put this in .streamlit/secrets.toml
-
-
-def get_connection():
-    return psycopg2.connect(st.secrets["postgres"]["url"])
+# --- DB CONNECTION ---
+# This looks for DB_URI in your local secrets.toml OR the Streamlit Cloud Secrets dashboard
+def get_conn():
+    return psycopg.connect(st.secrets["DB_URI"])
 
 def init_db():
-    """Initializes tables in PostgreSQL if they don't exist"""
-    conn = get_connection()
-    c = conn.cursor()
-    
-    # 1. SWITCHES (White Rabbits)
-    # Note: 'SERIAL' is used for auto-increment in Postgres
-    c.execute('''CREATE TABLE IF NOT EXISTS switches (
-        id SERIAL PRIMARY KEY,
-        name TEXT UNIQUE,
-        role TEXT,
-        mac TEXT,
-        custom_attributes TEXT
-    )''')
-    
-    # 2. SFPS (Inventory)
-    c.execute('''CREATE TABLE IF NOT EXISTS sfps (
-        id SERIAL PRIMARY KEY,
-        serial TEXT UNIQUE,
-        wavelength TEXT,
-        tx_cal_alpha FLOAT,
-        rx_cal_alpha FLOAT,
-        custom_attributes TEXT
-    )''')
-    
-    # 3. PORTS
-    c.execute('''CREATE TABLE IF NOT EXISTS ports (
-        id SERIAL PRIMARY KEY,
-        switch_id INTEGER REFERENCES switches(id),
-        port_number INTEGER,
-        sfp_id INTEGER REFERENCES sfps(id),
-        connected_to_switch_id INTEGER REFERENCES switches(id),
-        port_cal_tx FLOAT DEFAULT 0.0,
-        port_cal_rx FLOAT DEFAULT 0.0
-    )''')
-    
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1. White Rabbit Switches
+            cur.execute('''CREATE TABLE IF NOT EXISTS switches (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE,
+                role TEXT,
+                mac TEXT,
+                clock_source TEXT,
+                remarks TEXT
+            )''')
+            # 2. SFPs Inventory
+            cur.execute('''CREATE TABLE IF NOT EXISTS sfps (
+                id SERIAL PRIMARY KEY,
+                serial TEXT UNIQUE,
+                wavelength TEXT,
+                alpha FLOAT, 
+                delta_tx FLOAT,
+                delta_rx FLOAT,
+                remarks TEXT
+            )''')
+            # 3. Ports & Topology (The Linkage)
+            cur.execute('''CREATE TABLE IF NOT EXISTS ports (
+                id SERIAL PRIMARY KEY,
+                switch_id INTEGER REFERENCES switches(id),
+                port_num INTEGER,
+                sfp_id INTEGER REFERENCES sfps(id),
+                connected_to_id INTEGER REFERENCES switches(id),
+                port_delta_tx FLOAT DEFAULT 0,
+                port_delta_rx FLOAT DEFAULT 0,
+                remarks TEXT
+            )''')
+        conn.commit()
 
-# --- HELPER: Handle Dynamic JSON Fields ---
-def unpack_attributes(json_str):
-    try:
-        return json.loads(json_str) if json_str else {}
-    except:
-        return {}
-
-def render_dynamic_fields_input(current_data=None):
-    st.markdown("#### 🔧 Custom Attributes")
-    current_dict = unpack_attributes(current_data)
-    new_keys = st.text_area("Add keys (one per line)", value="\n".join(current_dict.keys()))
-    
-    updated_dict = {}
-    if new_keys:
-        for key in new_keys.split("\n"):
-            key = key.strip()
-            if not key: continue
-            val = st.text_input(f"Value for '{key}'", value=current_dict.get(key, ""))
-            updated_dict[key] = val
-            
-    return json.dumps(updated_dict)
-
-# --- MAIN APP ---
-st.set_page_config(layout="wide", page_title="White Rabbit Networker (Cloud)")
-
-# Initialize DB on first load
+# --- APP SETUP ---
+st.set_page_config(layout="wide", page_title="White Rabbit Manager")
 try:
     init_db()
 except Exception as e:
-    st.error(f"Database Connection Failed: {e}")
+    st.error(f"Database Connection Failed. Check your secrets! Error: {e}")
     st.stop()
 
-st.title("🐇 White Rabbit Manager (Neon DB)")
-tabs = st.tabs(["Network Map", "Add Switch", "SFP Inventory", "Port Manager", "Generate Config"])
+st.title("🐇 White Rabbit Network Manager")
+tabs = st.tabs(["🗺️ Topology Map", "🖥️ Switches", "🔌 SFP Inventory", "⚙️ Port Calibration", "📄 .config Gen"])
 
-# --- TAB 1: NETWORK MAP ---
+# --- TAB: NETWORK MAP ---
 with tabs[0]:
-    st.header("Network Topology")
-    conn = get_connection()
-    query = """
-    SELECT 
-        s1.name as "Switch", 
-        p.port_number as "Port",
-        sfp.serial as "SFP Serial",
-        s2.name as "Connected To"
-    FROM ports p
-    JOIN switches s1 ON p.switch_id = s1.id
-    LEFT JOIN switches s2 ON p.connected_to_switch_id = s2.id
-    LEFT JOIN sfps sfp ON p.sfp_id = sfp.id
-    """
-    df = pd.read_sql(query, conn)
-    st.dataframe(df, use_container_width=True)
-    conn.close()
+    st.subheader("Visual Topology")
+    with get_conn() as conn:
+        df_sw = pd.read_sql("SELECT id, name, role FROM switches", conn)
+        df_links = pd.read_sql("SELECT switch_id, connected_to_id, port_num FROM ports WHERE connected_to_id IS NOT NULL", conn)
+    
+    if df_sw.empty:
+        st.info("Add switches to see the map.")
+    else:
+        dot = Digraph()
+        dot.attr(rankdir='TB', bgcolor='#0e1117', fontcolor='white')
+        dot.attr('node', shape='record', style='filled', color='#1f77b4', fontcolor='white')
 
-# --- TAB 2: ADD SWITCH ---
+        for _, s in df_sw.iterrows():
+            color = "#2ca02c" if "Grandmaster" in s['role'] else "#1f77b4"
+            dot.node(str(s['id']), f"{{ {s['name']} | {s['role']} }}", fillcolor=color)
+
+        for _, l in df_links.iterrows():
+            dot.edge(str(l['switch_id']), str(l['connected_to_id']), label=f"Port {l['port_num']}")
+        
+        st.graphviz_chart(dot)
+
+# --- TAB: SWITCHES ---
 with tabs[1]:
-    with st.form("add_switch"):
-        st.subheader("Register White Rabbit Device")
+    with st.form("sw_form"):
         col1, col2 = st.columns(2)
-        name = col1.text_input("Hostname", "WR-SW-01")
-        role = col2.selectbox("Clock Role", ["Grandmaster", "Boundary Clock", "Slave"])
-        mac = st.text_input("Base MAC Address")
-        custom_json = render_dynamic_fields_input()
-        
-        if st.form_submit_button("Save Device"):
-            conn = get_connection()
-            try:
-                cur = conn.cursor()
-                cur.execute("INSERT INTO switches (name, role, mac, custom_attributes) VALUES (%s,%s,%s,%s)", 
-                             (name, role, mac, custom_json))
-                conn.commit()
-                st.success(f"Deployed {name}")
-            except Exception as e:
-                st.error(f"Error: {e}")
-            finally:
-                conn.close()
+        name = col1.text_input("Switch Name", placeholder="e.g., WRS-SYD-01")
+        role = col2.selectbox("Role", ["Grandmaster", "Boundary Clock", "Slave"])
+        mac = st.text_input("MAC Address")
+        rem = st.text_area("Remarks")
+        if st.form_submit_button("Add Switch"):
+            with get_conn() as conn:
+                conn.execute("INSERT INTO switches (name, role, mac, remarks) VALUES (%s,%s,%s,%s)", (name, role, mac, rem))
+            st.success(f"Switch {name} added!")
 
-# --- TAB 3: SFP INVENTORY ---
+# --- TAB: SFPs ---
 with tabs[2]:
-    st.info("Manage SFP Inventory")
-    with st.form("add_sfp"):
+    with st.form("sfp_form"):
         c1, c2, c3 = st.columns(3)
-        sn = c1.text_input("Serial Number")
-        wv = c2.text_input("Wavelength (nm)", "1310/1550")
-        
-        c4, c5 = st.columns(2)
-        tx_a = c4.number_input("Tx Alpha", format="%.5f")
-        rx_a = c5.number_input("Rx Alpha", format="%.5f")
-        sfp_json = render_dynamic_fields_input()
-        
-        if st.form_submit_button("Add SFP"):
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute("INSERT INTO sfps (serial, wavelength, tx_cal_alpha, rx_cal_alpha, custom_attributes) VALUES (%s,%s,%s,%s,%s)",
-                         (sn, wv, tx_a, rx_a, sfp_json))
-            conn.commit()
-            conn.close()
-            st.success("SFP Added")
+        sn = c1.text_input("SFP Serial Number")
+        wv = c2.text_input("Wavelength (nm)")
+        al = c3.number_input("Alpha Parameter", format="%.10f")
+        dtx = st.number_input("SFP Delta Tx (ps)")
+        drx = st.number_input("SFP Delta Rx (ps)")
+        rem_sfp = st.text_area("SFP Remarks")
+        if st.form_submit_button("Save SFP"):
+            with get_conn() as conn:
+                conn.execute("INSERT INTO sfps (serial, wavelength, alpha, delta_tx, delta_rx, remarks) VALUES (%s,%s,%s,%s,%s,%s)", 
+                             (sn, wv, al, dtx, drx, rem_sfp))
+            st.success("SFP saved to inventory.")
 
-# --- TAB 4: PORT MANAGER ---
+# --- TAB: PORT CALIBRATION ---
 with tabs[3]:
-    st.subheader("Port Configuration")
-    conn = get_connection()
-    switches = pd.read_sql("SELECT id, name FROM switches", conn)
-    
-    if not switches.empty:
-        sw_name = st.selectbox("Select Switch", switches['name'])
-        sw_id = int(switches[switches['name'] == sw_name]['id'].values[0])
-        
-        # Get Available SFPs
-        avail_sfps = pd.read_sql("SELECT id, serial FROM sfps", conn)
-        
-        with st.form("port_config"):
-            c1, c2 = st.columns(2)
-            p_num = c1.number_input("Port Number", min_value=1, max_value=18, step=1)
-            
-            c3, c4 = st.columns(2)
-            p_tx = c3.number_input("Port PCB Tx Delay (ps)", value=0.0)
-            p_rx = c4.number_input("Port PCB Rx Delay (ps)", value=0.0)
-            
-            st.divider()
-            sfp_choice = st.selectbox("Plug in SFP", ["None"] + avail_sfps['serial'].tolist())
-            
-            others = switches[switches['id'] != sw_id]
-            link_choice = st.selectbox("Link to Switch", ["Disconnected"] + others['name'].tolist())
-            
-            if st.form_submit_button("Configure Port"):
-                sfp_db_id = int(avail_sfps[avail_sfps['serial'] == sfp_choice]['id'].values[0]) if sfp_choice != "None" else None
-                link_db_id = int(others[others['name'] == link_choice]['id'].values[0]) if link_choice != "Disconnected" else None
+    with get_conn() as conn:
+        sw_list = pd.read_sql("SELECT id, name FROM switches", conn)
+        sfp_list = pd.read_sql("SELECT id, serial FROM sfps", conn)
 
-                cur = conn.cursor()
-                # Simple Insert (For production, use upsert/update logic)
-                cur.execute("""INSERT INTO ports 
-                             (switch_id, port_number, sfp_id, connected_to_switch_id, port_cal_tx, port_cal_rx) 
-                             VALUES (%s,%s,%s,%s,%s,%s)""",
-                             (sw_id, p_num, sfp_db_id, link_db_id, p_tx, p_rx))
-                conn.commit()
-                st.success("Port Configured")
-    conn.close()
+    if not sw_list.empty:
+        with st.form("port_form"):
+            target_sw = st.selectbox("Switch", sw_list['name'])
+            p_idx = st.number_input("Port Number", 1, 18)
+            sfp_sn = st.selectbox("Plugged SFP", ["None"] + sfp_list['serial'].tolist())
+            link_to = st.selectbox("Connected to Switch", ["None"] + sw_list['name'].tolist())
+            p_dtx = st.number_input("Port PCB Delta Tx (ps)")
+            p_drx = st.number_input("Port PCB Delta Rx (ps)")
+            p_rem = st.text_area("Port Remarks")
+            
+            if st.form_submit_button("Update Port"):
+                sw_id = int(sw_list[sw_list['name'] == target_sw]['id'].values[0])
+                sfp_id = int(sfp_list[sfp_list['serial'] == sfp_sn]['id'].values[0]) if sfp_sn != "None" else None
+                link_id = int(sw_list[sw_list['name'] == link_to]['id'].values[0]) if link_to != "None" else None
+                
+                with get_conn() as conn:
+                    conn.execute("""INSERT INTO ports (switch_id, port_num, sfp_id, connected_to_id, port_delta_tx, port_delta_rx, remarks) 
+                                 VALUES (%s,%s,%s,%s,%s,%s,%s)""", (sw_id, p_idx, sfp_id, link_id, p_dtx, p_drx, p_rem))
+                st.success("Port configured.")
 
-# --- TAB 5: GENERATE CONFIG ---
+# --- TAB: CONFIG GEN ---
 with tabs[4]:
-    st.header("White Rabbit `dot-config` Generator")
-    conn = get_connection()
-    switches = pd.read_sql("SELECT id, name FROM switches", conn)
-    
-    target_sw = st.selectbox("Select Target Switch", switches['name']) if not switches.empty else None
-    
-    if target_sw and st.button("Generate Config"):
-        s_data = pd.read_sql(f"SELECT * FROM switches WHERE name='{target_sw}'", conn).iloc[0]
-        sw_id = s_data['id']
-        
-        # Advanced query to join SFP data
-        p_data = pd.read_sql(f"""
-            SELECT p.*, s.serial as sfp_sn, s.tx_cal_alpha, s.rx_cal_alpha 
-            FROM ports p 
-            LEFT JOIN sfps s ON p.sfp_id = s.id 
-            WHERE p.switch_id={sw_id}
-        """, conn)
-        
-        config_lines = [
-            f"# WR CONFIG: {s_data['name']}",
-            f"CONFIG_WR_NODE_MAC=\"{s_data['mac']}\""
-        ]
-        
-        for _, port in p_data.iterrows():
-            idx = port['port_number']
-            config_lines.append(f"\n# PORT {idx}")
-            if port['sfp_sn']:
-                config_lines.append(f"CONFIG_PORT{idx}_SFP_SERIAL=\"{port['sfp_sn']}\"")
-            config_lines.append(f"CONFIG_PORT{idx}_PCB_TX_DELAY={port['port_cal_tx']}")
-            config_lines.append(f"CONFIG_PORT{idx}_PCB_RX_DELAY={port['port_cal_rx']}")
+    if not sw_list.empty:
+        sel_sw = st.selectbox("Generate Config for:", sw_list['name'])
+        if st.button("Generate .config"):
+            with get_conn() as conn:
+                sw_data = pd.read_sql(f"SELECT * FROM switches WHERE name='{sel_sw}'", conn).iloc[0]
+                ports = pd.read_sql(f"""
+                    SELECT p.*, s.serial, s.alpha, s.delta_tx as s_tx, s.delta_rx as s_rx 
+                    FROM ports p LEFT JOIN sfps s ON p.sfp_id = s.id 
+                    WHERE p.switch_id = {sw_data['id']}""", conn)
             
-        st.code("\n".join(config_lines))
-    conn.close()
+            cfg = [f"# White Rabbit Config: {sw_data['name']}", f"CONFIG_WR_NODE_MAC=\"{sw_data['mac']}\""]
+            for _, p in ports.iterrows():
+                i = p['port_num']
+                cfg.append(f"\n# Port {i} [{p['remarks'] or 'No Remarks'}]")
+                cfg.append(f"CONFIG_PORT{i}_SFP_ALPHA={p['alpha'] or 0}")
+                # Total Delta = SFP Delta + Port PCB Delta
+                cfg.append(f"CONFIG_PORT{i}_DELTA_TX={int((p['s_tx'] or 0) + p['port_delta_tx'])}")
+                cfg.append(f"CONFIG_PORT{i}_DELTA_RX={int((p['s_rx'] or 0) + p['port_delta_rx'])}")
+            
+            st.code("\n".join(cfg))
