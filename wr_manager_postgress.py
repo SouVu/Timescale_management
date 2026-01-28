@@ -3,340 +3,431 @@ import pandas as pd
 import psycopg
 import io
 import zipfile
+import json
 from graphviz import Digraph
 
-# --- OPTIMIZED DB CONNECTION (CACHED) ---
+# --- 1. ROBUST DATABASE CONNECTION ---
 @st.cache_resource
 def get_db_connection():
-    """Establishes a persistent connection to the database."""
-    return psycopg.connect(st.secrets["DB_URI"], autocommit=True)
+    """Establishes a persistent connection to PostgreSQL."""
+    try:
+        # Connect to Postgres
+        return psycopg.connect(st.secrets["DB_URI"], autocommit=True)
+    except Exception as e:
+        st.error(f"❌ Critical Database Error: {e}")
+        st.stop()
 
-try:
-    conn = get_db_connection()
-except Exception as e:
-    st.error("❌ Connection failed. Please check your DB_URI in secrets.")
-    st.stop()
+conn = get_db_connection()
 
-def run_query(query, params=None):
-    """Helper to run queries with error handling for schema changes."""
+# --- 2. HELPERS ---
+def run_query(query, params=None, fetch=False):
+    """Safe query runner with error reporting."""
     try:
         with conn.cursor() as cur:
             cur.execute(query, params)
-            if query.strip().upper().startswith("SELECT"):
+            if fetch:
                 return cur.fetchall(), cur.description
-    except psycopg.errors.FeatureNotSupported:
-        # Handles the 'cached plan' error by forcing a reload next time
-        st.cache_resource.clear()
-        st.rerun()
+            return True, None
     except Exception as e:
-        st.error(f"Database Error: {e}")
-    return None, None
+        st.error(f"SQL Error: {e}")
+        return False, None
 
 def get_df(query, params=None):
-    """Helper to get a Pandas DataFrame efficiently."""
+    """Get Pandas DataFrame safely."""
     try:
         return pd.read_sql(query, conn, params=params)
-    except Exception:
-        # If schema changed, read_sql might fail. Clear cache and retry.
-        st.cache_resource.clear()
+    except Exception as e:
+        st.error(f"Data Load Error: {e}")
         return pd.DataFrame()
 
 def init_db():
+    """Initialize DB with JSONB support for dynamic fields."""
     with conn.cursor() as cur:
-        # 1. Projects
-        cur.execute("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, name TEXT UNIQUE)")
+        # Projects now track custom field keys
+        cur.execute("""CREATE TABLE IF NOT EXISTS projects (
+            id SERIAL PRIMARY KEY, 
+            name TEXT UNIQUE, 
+            custom_schema JSONB DEFAULT '{}'::jsonb
+        )""")
         
-        # 2. Switches
+        # Switches with JSONB metadata
         cur.execute("""CREATE TABLE IF NOT EXISTS switches (
-            id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id), 
-            name TEXT UNIQUE, role TEXT, ip_address TEXT, mac TEXT, 
-            clock_source TEXT, jitter_type TEXT, remarks TEXT)""")
+            id SERIAL PRIMARY KEY, 
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE, 
+            name TEXT, 
+            role TEXT, 
+            ip_address TEXT, 
+            mac TEXT, 
+            clock_source TEXT,
+            metadata JSONB DEFAULT '{}'::jsonb,
+            UNIQUE(project_id, name)
+        )""")
         
-        # 3. SFPs
+        # SFPs
         cur.execute("""CREATE TABLE IF NOT EXISTS sfps (
-            id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id),
-            serial TEXT UNIQUE, wavelength TEXT, channel TEXT, 
-            alpha FLOAT DEFAULT 0, delta_tx FLOAT DEFAULT 0, delta_rx FLOAT DEFAULT 0, 
-            remarks TEXT)""")
+            id SERIAL PRIMARY KEY, 
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            serial TEXT, 
+            wavelength TEXT, 
+            channel TEXT, 
+            alpha FLOAT DEFAULT 0, 
+            delta_tx FLOAT DEFAULT 0, 
+            delta_rx FLOAT DEFAULT 0, 
+            metadata JSONB DEFAULT '{}'::jsonb,
+            UNIQUE(project_id, serial)
+        )""")
         
-        # 4. Ports
+        # Ports
         cur.execute("""CREATE TABLE IF NOT EXISTS ports (
-            id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id),
-            switch_id INTEGER REFERENCES switches(id), port_num INTEGER, 
-            sfp_id INTEGER REFERENCES sfps(id),
-            remote_sfp_id INTEGER REFERENCES sfps(id),
-            connected_to_id INTEGER REFERENCES switches(id), connected_port_num INTEGER,
-            port_delta_tx FLOAT DEFAULT 0, port_delta_rx FLOAT DEFAULT 0,
-            vlan INTEGER)""")
-        
-        # Migrations
-        cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS clock_source TEXT")
-        cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS jitter_type TEXT")
-        cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS remarks TEXT")
-        cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS delta_tx FLOAT DEFAULT 0")
-        cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS delta_rx FLOAT DEFAULT 0")
-        cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS remarks TEXT")
-        cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS remote_sfp_id INTEGER")
-        cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS port_delta_tx FLOAT DEFAULT 0")
-        cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS port_delta_rx FLOAT DEFAULT 0")
-        cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS vlan INTEGER")
+            id SERIAL PRIMARY KEY, 
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            switch_id INTEGER REFERENCES switches(id) ON DELETE CASCADE, 
+            port_num INTEGER, 
+            sfp_id INTEGER REFERENCES sfps(id) ON DELETE SET NULL,
+            remote_sfp_id INTEGER REFERENCES sfps(id) ON DELETE SET NULL,
+            connected_to_id INTEGER REFERENCES switches(id) ON DELETE SET NULL, 
+            connected_port_num INTEGER,
+            port_delta_tx FLOAT DEFAULT 0, 
+            port_delta_rx FLOAT DEFAULT 0,
+            vlan INTEGER,
+            metadata JSONB DEFAULT '{}'::jsonb
+        )""")
 
-# --- APP SETUP ---
-st.set_page_config(layout="wide", page_title="White Rabbit Manager")
+# --- 3. LOGIC: DUPLICATION & DYNAMIC FIELDS ---
+def duplicate_network(old_pid, new_name):
+    """Deep copy of a network."""
+    try:
+        with conn.cursor() as cur:
+            # 1. Create New Project
+            cur.execute("INSERT INTO projects (name, custom_schema) SELECT %s, custom_schema FROM projects WHERE id=%s RETURNING id", (new_name, old_pid))
+            new_pid = cur.fetchone()[0]
+
+            # 2. Copy Switches & Map IDs
+            cur.execute("SELECT id, name, role, ip_address, mac, clock_source, metadata FROM switches WHERE project_id=%s", (old_pid,))
+            switches = cur.fetchall()
+            sw_map = {} # old_id -> new_id
+            for s in switches:
+                cur.execute("""INSERT INTO switches (project_id, name, role, ip_address, mac, clock_source, metadata) 
+                               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""", 
+                               (new_pid, s[1], s[2], s[3], s[4], s[5], s[6]))
+                sw_map[s[0]] = cur.fetchone()[0]
+
+            # 3. Copy SFPs & Map IDs
+            cur.execute("SELECT id, serial, wavelength, channel, alpha, delta_tx, delta_rx, metadata FROM sfps WHERE project_id=%s", (old_pid,))
+            sfps = cur.fetchall()
+            sfp_map = {}
+            for s in sfps:
+                cur.execute("""INSERT INTO sfps (project_id, serial, wavelength, channel, alpha, delta_tx, delta_rx, metadata) 
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""", 
+                               (new_pid, s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
+                sfp_map[s[0]] = cur.fetchone()[0]
+
+            # 4. Copy Ports (Translate IDs)
+            cur.execute("SELECT switch_id, port_num, sfp_id, remote_sfp_id, connected_to_id, connected_port_num, port_delta_tx, port_delta_rx, vlan, metadata FROM ports WHERE project_id=%s", (old_pid,))
+            ports = cur.fetchall()
+            for p in ports:
+                sid = sw_map.get(p[0])
+                sfpid = sfp_map.get(p[2])
+                rsfpid = sfp_map.get(p[3])
+                cid = sw_map.get(p[4])
+                if sid:
+                    cur.execute("""INSERT INTO ports (project_id, switch_id, port_num, sfp_id, remote_sfp_id, connected_to_id, connected_port_num, port_delta_tx, port_delta_rx, vlan, metadata)
+                                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""", 
+                                   (new_pid, sid, p[1], sfpid, rsfpid, cid, p[5], p[6], p[7], p[8], p[9]))
+        return True
+    except Exception as e:
+        st.error(f"Duplication Failed: {e}")
+        return False
+
+# --- 4. APP SETUP ---
+st.set_page_config(layout="wide", page_title="White Rabbit Platinum")
 init_db()
 
-# --- SIDEBAR ---
-st.sidebar.title("📂 Network Selector")
+# --- SIDEBAR: PROJECT MANAGEMENT ---
+st.sidebar.title("🎛️ Manager")
 
-# 1. Fetch Projects
-all_projects = get_df("SELECT * FROM projects")
-
-# 2. Project Selection Logic
-selected_project = None
-p_id = None
-
-if not all_projects.empty:
-    selected_project = st.sidebar.selectbox("Active Network", all_projects['name'])
-    p_id = int(all_projects[all_projects['name'] == selected_project]['id'].values[0])
-else:
-    st.sidebar.warning("⚠️ No networks found. Create one below.")
-
-# 3. Create Project (ALWAYS VISIBLE NOW)
-with st.sidebar.expander("➕ Create New Network", expanded=all_projects.empty):
-    new_p = st.text_input("Network Name")
-    if st.button("Create Network"):
-        if new_p:
-            run_query("INSERT INTO projects (name) VALUES (%s)", (new_p,))
-            st.rerun()
-
-# 4. Stop if no project is selected
-if p_id is None:
-    st.info("Please create or select a network to continue.")
+# Project Selection
+projects = get_df("SELECT * FROM projects ORDER BY id")
+if projects.empty:
+    st.warning("No networks found.")
+    p_name = st.text_input("Create First Network")
+    if st.button("Create"):
+        run_query("INSERT INTO projects (name) VALUES (%s)", (p_name,))
+        st.rerun()
     st.stop()
 
-st.sidebar.divider()
+sel_p_name = st.sidebar.selectbox("Select Network", projects['name'])
+pid = int(projects[projects['name'] == sel_p_name]['id'].values[0])
 
-# 5. Delete Project
-with st.sidebar.expander("❌ Delete Project"):
-    if st.button("DELETE PROJECT"):
-        run_query("DELETE FROM ports WHERE project_id=%s", (p_id,))
-        run_query("DELETE FROM sfps WHERE project_id=%s", (p_id,))
-        run_query("DELETE FROM switches WHERE project_id=%s", (p_id,))
-        run_query("DELETE FROM projects WHERE id=%s", (p_id,))
-        st.cache_resource.clear() # Clear cache to refresh state immediately
+# --- DYNAMIC FIELD CONFIG ---
+# Load schema: {"switch": ["Jitter", "Location"], "sfp": ["Vendor"]}
+current_schema = projects[projects['id']==pid]['custom_schema'].values[0]
+if not current_schema: current_schema = {}
+
+with st.sidebar.expander("🛠️ Custom Fields"):
+    st.write("Add fields to your forms dynamically.")
+    new_field_type = st.selectbox("Target", ["Switch", "SFP", "Port"])
+    new_field_name = st.text_input("Field Name (e.g. Jitter)")
+    if st.button("Add Field"):
+        key = new_field_type.lower()
+        if key not in current_schema: current_schema[key] = []
+        if new_field_name and new_field_name not in current_schema[key]:
+            current_schema[key].append(new_field_name)
+            run_query("UPDATE projects SET custom_schema = %s WHERE id=%s", (json.dumps(current_schema), pid))
+            st.rerun()
+    
+    # Show active fields
+    st.write("Active Fields:", current_schema)
+
+# --- DUPLICATION & DELETE ---
+with st.sidebar.expander("⚡ Actions"):
+    st.write("**Duplicate Network**")
+    dup_name = st.text_input("New Name for Copy")
+    if st.button("Duplicate"):
+        if duplicate_network(pid, dup_name):
+            st.success("Network Duplicated!")
+            st.rerun()
+            
+    st.divider()
+    if st.button("DELETE NETWORK", type="primary"):
+        run_query("DELETE FROM projects WHERE id=%s", (pid,))
         st.rerun()
 
-# --- MAIN UI ---
-st.title(f"🐇 {selected_project} Dashboard")
+# --- TABS ---
+st.title(f"🐇 {sel_p_name}")
 tabs = st.tabs(["🗺️ Map", "🖥️ Switches", "🔌 SFPs", "⚙️ Connections", "💾 Backup", "📐 Calc"])
 
 # --- TAB 1: SWITCHES ---
 with tabs[1]:
     st.subheader("Switches")
-    df_sw = get_df("SELECT * FROM switches WHERE project_id=%s ORDER BY name", (p_id,))
-    st.dataframe(df_sw, use_container_width=True)
+    # Fetch Data
+    sw_df = get_df("SELECT * FROM switches WHERE project_id=%s ORDER BY name", (pid,))
+    
+    # Flatten metadata for display
+    display_df = sw_df.copy()
+    if not display_df.empty:
+        meta_df = pd.json_normalize(display_df['metadata'])
+        display_df = display_df.drop(columns=['metadata']).join(meta_df)
+    
+    st.dataframe(display_df, use_container_width=True)
 
+    # Form
     with st.form("sw_form"):
-        st.write("**Add / Update Switch**")
+        st.write("### Add / Update Switch")
         c1, c2, c3 = st.columns(3)
-        sw_name = c1.text_input("Name", placeholder="e.g. WRS-1")
-        sw_ip = c2.text_input("IP")
-        sw_mac = c3.text_input("MAC")
+        s_name = c1.text_input("Name (Unique)", placeholder="WRS-1")
+        s_ip = c2.text_input("IP Address")
+        s_mac = c3.text_input("MAC Address")
         
-        c4, c5, c6 = st.columns(3)
-        sw_role = c4.selectbox("Role", ["Grandmaster", "Boundary", "Slave", "Timescale Slave"])
-        sw_clk = c5.text_input("Clock Source")
-        sw_jit = c6.selectbox("Jitter Type", ["Normal", "Low Jitter"]) 
-        
-        c7 = st.columns(1)[0]
-        sw_rem = c7.text_input("Remarks")
+        c4, c5 = st.columns(2)
+        s_role = c4.selectbox("Role", ["Grandmaster", "Boundary", "Slave"])
+        s_clk = c5.text_input("Clock Source")
+
+        # Dynamic Fields Loop
+        custom_vals = {}
+        if "switch" in current_schema:
+            st.write("#### Custom Fields")
+            cols = st.columns(3)
+            for i, field in enumerate(current_schema["switch"]):
+                # Retrieve existing value if editing? (Simple version: just input)
+                custom_vals[field] = cols[i % 3].text_input(field)
 
         if st.form_submit_button("Save Switch"):
-            if sw_name:
-                run_query("""INSERT INTO switches (project_id, name, ip_address, mac, role, clock_source, jitter_type, remarks) 
-                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
-                             ON CONFLICT (name) DO UPDATE SET 
-                                ip_address=EXCLUDED.ip_address, 
-                                mac=EXCLUDED.mac, 
-                                role=EXCLUDED.role, 
-                                clock_source=EXCLUDED.clock_source,
-                                jitter_type=EXCLUDED.jitter_type,
-                                remarks=EXCLUDED.remarks""", 
-                             (p_id, sw_name, sw_ip, sw_mac, sw_role, sw_clk, sw_jit, sw_rem))
+            if s_name:
+                # Check if exists to decide Update vs Insert
+                exists = not sw_df[sw_df['name'] == s_name].empty
+                
+                meta_json = json.dumps(custom_vals)
+                
+                if exists:
+                    # Update
+                    ok, _ = run_query("""UPDATE switches SET ip_address=%s, mac=%s, role=%s, clock_source=%s, metadata=%s 
+                                         WHERE project_id=%s AND name=%s""", 
+                                         (s_ip, s_mac, s_role, s_clk, meta_json, pid, s_name))
+                    if ok: st.success(f"Updated {s_name}")
+                else:
+                    # Insert
+                    ok, _ = run_query("""INSERT INTO switches (project_id, name, ip_address, mac, role, clock_source, metadata) 
+                                         VALUES (%s, %s, %s, %s, %s, %s, %s)""", 
+                                         (pid, s_name, s_ip, s_mac, s_role, s_clk, meta_json))
+                    if ok: st.success(f"Created {s_name}")
+                    else: st.error("Failed to create switch. Name might be duplicate.")
                 st.rerun()
 
-    with st.expander("🗑️ Delete Switch"):
-        if not df_sw.empty:
-            del_sw = st.selectbox("Select Switch", df_sw['name'])
-            if st.button("Confirm Delete Switch"):
-                sid = int(df_sw[df_sw['name']==del_sw]['id'].values[0])
-                run_query("DELETE FROM ports WHERE switch_id=%s OR connected_to_id=%s", (sid, sid))
-                run_query("DELETE FROM switches WHERE id=%s", (sid,))
+    # Delete
+    if not sw_df.empty:
+        with st.expander("Delete Switch"):
+            del_target = st.selectbox("Switch to delete", sw_df['name'])
+            if st.button("Confirm Delete"):
+                run_query("DELETE FROM switches WHERE project_id=%s AND name=%s", (pid, del_target))
                 st.rerun()
 
 # --- TAB 2: SFPs ---
 with tabs[2]:
     st.subheader("SFPs")
-    df_sfp = get_df("SELECT * FROM sfps WHERE project_id=%s ORDER BY serial", (p_id,))
-    st.dataframe(df_sfp, use_container_width=True)
+    sfp_df = get_df("SELECT * FROM sfps WHERE project_id=%s ORDER BY serial", (pid,))
+    
+    # Flatten metadata
+    d_sfp = sfp_df.copy()
+    if not d_sfp.empty:
+        m_sfp = pd.json_normalize(d_sfp['metadata'])
+        d_sfp = d_sfp.drop(columns=['metadata']).join(m_sfp)
+    st.dataframe(d_sfp, use_container_width=True)
 
     with st.form("sfp_form"):
-        st.write("**Add / Update SFP**")
+        st.write("### Add / Update SFP")
         c1, c2, c3, c4 = st.columns(4)
         sn = c1.text_input("Serial Number")
         ch = c2.text_input("Channel")
         wv = c3.text_input("Wavelength")
-        al = c4.number_input("Alpha", value=0.0, format="%.6f")
-        c5, c6, c7 = st.columns(3)
-        dtx = c5.number_input("SFP Delta Tx", value=0.0, format="%.4f")
-        drx = c6.number_input("SFP Delta Rx", value=0.0, format="%.4f")
-        rem = c7.text_input("Remarks")
+        al = c4.number_input("Alpha", format="%.6f")
+        c5, c6 = st.columns(2)
+        dtx = c5.number_input("Delta Tx", format="%.4f")
+        drx = c6.number_input("Delta Rx", format="%.4f")
+        
+        # Dynamic Fields
+        custom_sfp = {}
+        if "sfp" in current_schema:
+            st.write("#### Custom Fields")
+            cols = st.columns(3)
+            for i, field in enumerate(current_schema["sfp"]):
+                custom_sfp[field] = cols[i % 3].text_input(field)
 
         if st.form_submit_button("Save SFP"):
             if sn:
-                run_query("""INSERT INTO sfps (project_id, serial, channel, wavelength, alpha, delta_tx, delta_rx, remarks) 
-                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
-                             ON CONFLICT (serial) DO UPDATE SET channel=EXCLUDED.channel, wavelength=EXCLUDED.wavelength, alpha=EXCLUDED.alpha, delta_tx=EXCLUDED.delta_tx, delta_rx=EXCLUDED.delta_rx, remarks=EXCLUDED.remarks""", 
-                             (p_id, sn, ch, wv, al, dtx, drx, rem))
-                st.rerun()
-
-    with st.expander("🗑️ Delete SFP"):
-        if not df_sfp.empty:
-            del_sfp = st.selectbox("Select SFP", df_sfp['serial'])
-            if st.button("Confirm Delete SFP"):
-                sid = int(df_sfp[df_sfp['serial']==del_sfp]['id'].values[0])
-                run_query("UPDATE ports SET sfp_id=NULL WHERE sfp_id=%s", (sid,))
-                run_query("UPDATE ports SET remote_sfp_id=NULL WHERE remote_sfp_id=%s", (sid,))
-                run_query("DELETE FROM sfps WHERE id=%s", (sid,))
+                exists = not sfp_df[sfp_df['serial'] == sn].empty
+                meta_json = json.dumps(custom_sfp)
+                
+                if exists:
+                    run_query("""UPDATE sfps SET channel=%s, wavelength=%s, alpha=%s, delta_tx=%s, delta_rx=%s, metadata=%s 
+                                 WHERE project_id=%s AND serial=%s""", 
+                                 (ch, wv, al, dtx, drx, meta_json, pid, sn))
+                    st.success(f"Updated {sn}")
+                else:
+                    run_query("""INSERT INTO sfps (project_id, serial, channel, wavelength, alpha, delta_tx, delta_rx, metadata) 
+                                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""", 
+                                 (pid, sn, ch, wv, al, dtx, drx, meta_json))
+                    st.success(f"Created {sn}")
                 st.rerun()
 
 # --- TAB 3: CONNECTIONS ---
 with tabs[3]:
     st.subheader("Connections")
-    df_p = get_df(f"""
-        SELECT p.id, s1.name as local, p.port_num, 
-                sfp1.serial as l_sfp,
-                s2.name as remote, p.connected_port_num,
-                sfp2.serial as r_sfp,
-                p.port_delta_tx, p.port_delta_rx, p.vlan
+    # Complex join for readable table
+    conn_df = get_df(f"""
+        SELECT p.id, s1.name as local, p.port_num, sfp1.serial as l_sfp,
+               s2.name as remote, p.connected_port_num, sfp2.serial as r_sfp,
+               p.port_delta_tx, p.port_delta_rx, p.vlan, p.metadata
         FROM ports p 
         JOIN switches s1 ON p.switch_id=s1.id 
         LEFT JOIN switches s2 ON p.connected_to_id=s2.id 
         LEFT JOIN sfps sfp1 ON p.sfp_id=sfp1.id
         LEFT JOIN sfps sfp2 ON p.remote_sfp_id=sfp2.id
         WHERE p.project_id=%s ORDER BY s1.name, p.port_num
-    """, (p_id,))
+    """, (pid,))
     
-    st.dataframe(df_p, use_container_width=True)
+    st.dataframe(conn_df, use_container_width=True)
 
-    mode = st.radio("Action", ["Add New Link", "Edit Existing Link"], horizontal=True)
+    # UI Options
+    sw_opts = sw_df['name'].tolist() if not sw_df.empty else []
+    sfp_opts = ["None"] + sfp_df['serial'].tolist() if not sfp_df.empty else ["None"]
+    
+    mode = st.radio("Mode", ["New Link", "Edit Link"], horizontal=True)
 
-    sw_opts = df_sw['name'].tolist() if not df_sw.empty else []
-    sfp_opts = ["None"] + df_sfp['serial'].tolist() if not df_sfp.empty else ["None"]
-
-    if mode == "Add New Link":
-        with st.form("link_form"):
-            st.write("**New Connection**")
+    if mode == "New Link":
+        with st.form("new_link"):
+            st.write("#### Create Connection")
             c1, c2, c3 = st.columns(3)
-            
             l_sw = c1.selectbox("Local Switch", sw_opts)
             l_p = c1.number_input("Local Port", 1, 52)
             l_sfp = c1.selectbox("Local SFP", sfp_opts)
             
-            st.write("**Local Port Electronics Calibration**")
-            cd1, cd2, cd3 = st.columns(3)
-            p_dtx = cd1.number_input("Port Delta Tx (ns)", 0.0, format="%.4f")
-            p_drx = cd2.number_input("Port Delta Rx (ns)", 0.0, format="%.4f")
-            p_vlan = cd3.number_input("VLAN (0 = None)", 0, 4096, 0)
-
-            st.divider()
             c4, c5, c6 = st.columns(3)
-            r_sw = c4.selectbox("Remote Switch", ["None"] + sw_opts)
-            r_p = c5.number_input("Remote Port", 1, 52)
-            r_sfp = c6.selectbox("Remote SFP", sfp_opts)
+            p_dtx = c4.number_input("Port Delta Tx", 0.0)
+            p_drx = c5.number_input("Port Delta Rx", 0.0)
+            vlan = c6.number_input("VLAN ID", 0, 4096, 0)
             
+            st.divider()
+            r_sw = st.selectbox("Remote Switch", ["None"] + sw_opts)
+            r_p = st.number_input("Remote Port", 1, 52)
+            r_sfp = st.selectbox("Remote SFP", sfp_opts)
+
+            # Dynamic Port Fields
+            custom_port = {}
+            if "port" in current_schema:
+                st.write("#### Custom Fields")
+                cols = st.columns(3)
+                for i, field in enumerate(current_schema["port"]):
+                    custom_port[field] = cols[i % 3].text_input(field)
+
             if st.form_submit_button("Create Link"):
-                if not df_sw.empty and l_sw:
-                    lid = int(df_sw[df_sw['name']==l_sw]['id'].values[0])
-                    rid = int(df_sw[df_sw['name']==r_sw]['id'].values[0]) if r_sw != "None" else None
-                    sid1 = int(df_sfp[df_sfp['serial']==l_sfp]['id'].values[0]) if l_sfp != "None" else None
-                    sid2 = int(df_sfp[df_sfp['serial']==r_sfp]['id'].values[0]) if r_sfp != "None" else None
+                if not sw_df.empty and l_sw:
+                    # Resolve IDs safely
+                    lid = int(sw_df[sw_df['name']==l_sw]['id'].values[0])
+                    rid = int(sw_df[sw_df['name']==r_sw]['id'].values[0]) if r_sw != "None" else None
+                    sid1 = int(sfp_df[sfp_df['serial']==l_sfp]['id'].values[0]) if l_sfp != "None" else None
+                    sid2 = int(sfp_df[sfp_df['serial']==r_sfp]['id'].values[0]) if r_sfp != "None" else None
                     
-                    vlan_val = int(p_vlan) if p_vlan > 0 else None
-                    
-                    run_query("""INSERT INTO ports 
-                        (project_id, switch_id, port_num, sfp_id, remote_sfp_id, connected_to_id, connected_port_num, port_delta_tx, port_delta_rx, vlan) 
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""", 
-                        (p_id, lid, l_p, sid1, sid2, rid, r_p, p_dtx, p_drx, vlan_val))
+                    ok, _ = run_query("""INSERT INTO ports 
+                        (project_id, switch_id, port_num, sfp_id, remote_sfp_id, connected_to_id, connected_port_num, port_delta_tx, port_delta_rx, vlan, metadata) 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""", 
+                        (pid, lid, l_p, sid1, sid2, rid, r_p, p_dtx, p_drx, vlan if vlan > 0 else None, json.dumps(custom_port)))
+                    if ok: st.success("Link Created")
                     st.rerun()
 
-    elif mode == "Edit Existing Link":
-        if not df_p.empty:
-            lbls = df_p.apply(lambda x: f"ID {x['id']}: {x['local']} P{x['port_num']} -> {x['remote']}", axis=1)
+    elif mode == "Edit Link":
+        if not conn_df.empty:
+            lbls = conn_df.apply(lambda x: f"ID {x['id']}: {x['local']} P{x['port_num']} -> {x['remote']}", axis=1)
             sel = st.selectbox("Select Link", lbls)
             sel_id = int(sel.split(":")[0].replace("ID ", ""))
             
-            # Safe access to VLAN
-            if not df_p[df_p['id'] == sel_id].empty:
-                current_vlan = df_p[df_p['id'] == sel_id]['vlan'].values[0]
-                current_vlan = int(current_vlan) if pd.notna(current_vlan) else 0
-            else:
-                current_vlan = 0
-
             with st.form("edit_link"):
                 st.write(f"Editing {sel}")
-                ce1, ce2, ce3 = st.columns(3)
-                n_p_dtx = ce1.number_input("Update Port Delta Tx", 0.0, format="%.4f")
-                n_p_drx = ce2.number_input("Update Port Delta Rx", 0.0, format="%.4f")
-                n_vlan = ce3.number_input("Update VLAN", 0, 4096, current_vlan)
-                
-                n_lsfp = st.selectbox("Update Local SFP", sfp_opts)
-                
-                if st.form_submit_button("Update Link"):
-                    sid1 = int(df_sfp[df_sfp['serial']==n_lsfp]['id'].values[0]) if n_lsfp != "None" else None
-                    vlan_val = int(n_vlan) if n_vlan > 0 else None
-                    
-                    run_query("UPDATE ports SET port_delta_tx=%s, port_delta_rx=%s, vlan=%s, sfp_id=%s WHERE id=%s", 
-                                 (n_p_dtx, n_p_drx, vlan_val, sid1, sel_id))
+                # Fetch current values would be ideal, but for simplicity we allow overwrite
+                n_dtx = st.number_input("New Delta Tx", 0.0)
+                n_drx = st.number_input("New Delta Rx", 0.0)
+                if st.form_submit_button("Update"):
+                    run_query("UPDATE ports SET port_delta_tx=%s, port_delta_rx=%s WHERE id=%s", (n_dtx, n_drx, sel_id))
+                    st.success("Updated")
                     st.rerun()
-
-    with st.expander("🗑️ Delete Link"):
-        if not df_p.empty:
-            d_lbl = st.selectbox("Remove Link", df_p.apply(lambda x: f"ID {x['id']}: {x['local']} P{x['port_num']}", axis=1))
-            if st.button("Delete Selected Link"):
-                lid_del = int(d_lbl.split(":")[0].replace("ID ", ""))
-                run_query("DELETE FROM ports WHERE id=%s", (lid_del,))
+            
+            if st.button("Delete Link"):
+                run_query("DELETE FROM ports WHERE id=%s", (sel_id,))
                 st.rerun()
-
-# --- TAB 4: BACKUP ---
-with tabs[4]:
-    st.subheader("Backup")
-    if st.button("📦 Generate ZIP"):
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zf:
-            zf.writestr("switches.csv", get_df("SELECT * FROM switches WHERE project_id=%s", (p_id,)).to_csv(index=False))
-            zf.writestr("sfps.csv", get_df("SELECT * FROM sfps WHERE project_id=%s", (p_id,)).to_csv(index=False))
-            zf.writestr("ports.csv", get_df("SELECT * FROM ports WHERE project_id=%s", (p_id,)).to_csv(index=False))
-        st.download_button("⬇️ Download", zip_buffer.getvalue(), f"WR_Backup.zip", "application/zip")
 
 # --- TAB 0: MAP ---
 with tabs[0]:
-    links = get_df("SELECT switch_id, connected_to_id, port_num, connected_port_num, vlan FROM ports WHERE project_id=%s AND connected_to_id IS NOT NULL", (p_id,))
-    if not df_sw.empty:
+    if not sw_df.empty:
         dot = Digraph(format='pdf')
         dot.attr(rankdir='LR')
-        for _, s in df_sw.iterrows():
-            jit_lbl = f" ({s['jitter_type']})" if s['jitter_type'] else ""
-            dot.node(str(s['id']), f"{s['name']}{jit_lbl}\n{s['role']}\n{s['ip_address']}")
+        
+        # Nodes
+        for _, s in sw_df.iterrows():
+            # Parse metadata to show in map if needed?
+            # Keeping it simple for now to avoid clutter
+            lbl = f"{s['name']}\n{s['role']}\n{s['ip_address']}"
+            dot.node(str(s['id']), lbl)
+            
+        # Edges
+        links = get_df("SELECT switch_id, connected_to_id, port_num, connected_port_num, vlan FROM ports WHERE project_id=%s AND connected_to_id IS NOT NULL", (pid,))
         for _, l in links.iterrows():
-            vlan_txt = f"\nVLAN: {int(l['vlan'])}" if pd.notna(l['vlan']) else ""
+            vlan_txt = f"\nVLAN: {l['vlan']}" if pd.notna(l['vlan']) else ""
             dot.edge(str(l['switch_id']), str(l['connected_to_id']), label=f"P{l['port_num']}:P{l['connected_port_num']}{vlan_txt}")
+            
         st.graphviz_chart(dot)
-        try: st.download_button("📥 PDF", dot.pipe(), "topology.pdf")
-        except: pass
+
+# --- TAB 4: BACKUP ---
+with tabs[4]:
+    if st.button("📦 Download Full Backup"):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("switches.json", sw_df.to_json(orient='records'))
+            zf.writestr("sfps.json", sfp_df.to_json(orient='records'))
+            zf.writestr("connections.json", conn_df.to_json(orient='records'))
+        st.download_button("Download ZIP", buf.getvalue(), "network_backup.zip", "application/zip")
 
 # --- TAB 5: CALC ---
 with tabs[5]:
-    st.subheader("Fiber Calc")
-    d = st.number_input("Km", 0.0)
-    st.metric("Delay", f"{(d * 1000 * 1.4682 / 299792458 * 1e9):.2f} ns")
+    st.subheader("Fiber Calculator")
+    km = st.number_input("Length (km)", 0.0)
+    st.metric("One-Way Delay", f"{(km * 1000 * 1.4682 / 299792458 * 1e9):.2f} ns")
