@@ -6,7 +6,7 @@ import zipfile
 import json
 from graphviz import Digraph
 
-# --- 1. ROBUST DATABASE CONNECTION ---
+# --- 1. DB CONNECTION ---
 @st.cache_resource
 def get_db_connection():
     try:
@@ -19,7 +19,6 @@ conn = get_db_connection()
 
 # --- 2. HELPERS ---
 def run_query(query, params=None, fetch=False):
-    """Safe query runner."""
     try:
         with conn.cursor() as cur:
             cur.execute(query, params)
@@ -31,37 +30,29 @@ def run_query(query, params=None, fetch=False):
         return False, None
 
 def get_df(query, params=None):
-    """Get Pandas DataFrame safely."""
     try:
         return pd.read_sql(query, conn, params=params)
-    except Exception as e:
-        # If the query fails (e.g. column missing), clear cache to retry next time
+    except Exception:
         st.cache_resource.clear()
         return pd.DataFrame()
 
 def init_db():
-    """Initialize DB and FORCE MIGRATIONS for new columns."""
     with conn.cursor() as cur:
-        # Create Tables
+        # Tables
         cur.execute("""CREATE TABLE IF NOT EXISTS projects (
             id SERIAL PRIMARY KEY, name TEXT UNIQUE, custom_schema JSONB DEFAULT '{}'::jsonb
         )""")
-        
         cur.execute("""CREATE TABLE IF NOT EXISTS switches (
             id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE, 
             name TEXT, role TEXT, ip_address TEXT, mac TEXT, clock_source TEXT,
-            metadata JSONB DEFAULT '{}'::jsonb,
-            UNIQUE(project_id, name)
+            metadata JSONB DEFAULT '{}'::jsonb, UNIQUE(project_id, name)
         )""")
-        
         cur.execute("""CREATE TABLE IF NOT EXISTS sfps (
             id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
             serial TEXT, wavelength TEXT, channel TEXT, alpha FLOAT DEFAULT 0, 
             delta_tx FLOAT DEFAULT 0, delta_rx FLOAT DEFAULT 0,
-            metadata JSONB DEFAULT '{}'::jsonb,
-            UNIQUE(project_id, serial)
+            metadata JSONB DEFAULT '{}'::jsonb, UNIQUE(project_id, serial)
         )""")
-        
         cur.execute("""CREATE TABLE IF NOT EXISTS ports (
             id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
             switch_id INTEGER REFERENCES switches(id) ON DELETE CASCADE, 
@@ -72,22 +63,20 @@ def init_db():
             port_delta_rx FLOAT DEFAULT 0, vlan INTEGER,
             metadata JSONB DEFAULT '{}'::jsonb
         )""")
-
-        # --- AUTO-MIGRATIONS ---
-        # Ensure older databases get the new columns without crashing
+        # Migrations
         cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS custom_schema JSONB DEFAULT '{}'::jsonb")
         cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb")
         cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb")
         cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb")
 
-# --- 3. DUPLICATION LOGIC ---
+# --- 3. LOGIC ---
 def duplicate_network(old_pid, new_name):
     try:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO projects (name, custom_schema) SELECT %s, custom_schema FROM projects WHERE id=%s RETURNING id", (new_name, old_pid))
             new_pid = cur.fetchone()[0]
-
-            # Clone Switches
+            
+            # Copy Switches
             cur.execute("SELECT id, name, role, ip_address, mac, clock_source, metadata FROM switches WHERE project_id=%s", (old_pid,))
             switches = cur.fetchall()
             sw_map = {} 
@@ -96,7 +85,7 @@ def duplicate_network(old_pid, new_name):
                                (new_pid, s[1], s[2], s[3], s[4], s[5], s[6]))
                 sw_map[s[0]] = cur.fetchone()[0]
 
-            # Clone SFPs
+            # Copy SFPs
             cur.execute("SELECT id, serial, wavelength, channel, alpha, delta_tx, delta_rx, metadata FROM sfps WHERE project_id=%s", (old_pid,))
             sfps = cur.fetchall()
             sfp_map = {}
@@ -105,7 +94,7 @@ def duplicate_network(old_pid, new_name):
                                (new_pid, s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
                 sfp_map[s[0]] = cur.fetchone()[0]
 
-            # Clone Ports
+            # Copy Ports
             cur.execute("SELECT switch_id, port_num, sfp_id, remote_sfp_id, connected_to_id, connected_port_num, port_delta_tx, port_delta_rx, vlan, metadata FROM ports WHERE project_id=%s", (old_pid,))
             ports = cur.fetchall()
             for p in ports:
@@ -121,94 +110,83 @@ def duplicate_network(old_pid, new_name):
         st.error(f"Clone Failed: {e}")
         return False
 
-# --- 4. APP ENTRY ---
-st.set_page_config(layout="wide", page_title="WR Manager V3.1")
+# --- 4. APP START ---
+st.set_page_config(layout="wide", page_title="WR Manager Final")
 init_db()
 
-# --- SIDEBAR: NETWORK MANAGER ---
+# --- SIDEBAR ---
 st.sidebar.title("🎛️ Network Manager")
 
-# 1. Load Projects
+# 1. Project Selector
 projects = get_df("SELECT * FROM projects ORDER BY id")
-project_names = projects['name'].tolist() if not projects.empty else []
-
-# 2. Select Active Network
-selected_project = None
 pid = None
+selected_project = None
 
-if project_names:
-    selected_project = st.sidebar.selectbox("Active Network", project_names)
+if not projects.empty:
+    selected_project = st.sidebar.selectbox("Active Network", projects['name'])
     pid = int(projects[projects['name'] == selected_project]['id'].values[0])
 else:
     st.sidebar.warning("No networks found.")
 
-# 3. Create Network (ALWAYS VISIBLE)
-with st.sidebar.expander("➕ Create New Network"):
-    new_p_name = st.text_input("New Network Name")
+# 2. Create Project (Always Visible)
+with st.sidebar.expander("➕ Create New Network", expanded=projects.empty):
+    new_p_name = st.text_input("Name")
     if st.button("Create"):
         if new_p_name:
             if run_query("INSERT INTO projects (name) VALUES (%s)", (new_p_name,))[0]:
                 st.rerun()
             else:
-                st.error("Name already exists.")
+                st.error("Name taken.")
 
+# IF NO PROJECT SELECTED, STOP HERE
 if pid is None:
     st.stop()
 
-# 4. Custom Fields (Add/Remove)
+# 3. Custom Fields
 st.sidebar.divider()
-st.sidebar.subheader("🛠️ Custom Fields")
+with st.sidebar.expander("🛠️ Custom Fields"):
+    # Load Schema Safely
+    raw_schema = projects[projects['id']==pid]['custom_schema'].values[0]
+    current_schema = json.loads(raw_schema) if isinstance(raw_schema, str) else (raw_schema if raw_schema else {})
 
-# Fetch Schema Safely
-raw_schema = projects[projects['id']==pid]['custom_schema'].values[0]
-# Handle JSON decoding safely
-if isinstance(raw_schema, str):
-    try:
-        current_schema = json.loads(raw_schema)
-    except:
-        current_schema = {}
-elif isinstance(raw_schema, dict):
-    current_schema = raw_schema
-else:
-    current_schema = {}
-
-with st.sidebar.form("add_field_form"):
-    st.write("Add New Field")
-    c_type = st.selectbox("Target", ["Switch", "SFP", "Port"])
-    c_name = st.text_input("Field Name (e.g. Location)")
-    if st.form_submit_button("Add Field"):
+    # Add Field
+    st.write("**Add Field**")
+    c1, c2 = st.columns(2)
+    c_type = c1.selectbox("Target", ["Switch", "SFP", "Port"])
+    c_name = c2.text_input("Field Name")
+    if st.button("Add"):
         key = c_type.lower()
         if key not in current_schema: current_schema[key] = []
         if c_name and c_name not in current_schema[key]:
             current_schema[key].append(c_name)
             run_query("UPDATE projects SET custom_schema = %s WHERE id=%s", (json.dumps(current_schema), pid))
             st.rerun()
-
-with st.sidebar.expander("Remove Field"):
-    r_type = st.selectbox("Remove from", ["Switch", "SFP", "Port"], key="rm_type")
+    
+    # Remove Field
+    st.write("**Remove Field**")
+    r_type = st.selectbox("From", ["Switch", "SFP", "Port"], key="rm_t")
     r_key = r_type.lower()
     if r_key in current_schema and current_schema[r_key]:
-        r_field = st.selectbox("Select Field", current_schema[r_key])
-        if st.button("Remove Selected Field"):
+        r_field = st.selectbox("Select", current_schema[r_key])
+        if st.button("Remove"):
             current_schema[r_key].remove(r_field)
             run_query("UPDATE projects SET custom_schema = %s WHERE id=%s", (json.dumps(current_schema), pid))
             st.rerun()
-    else:
-        st.write("No fields to remove.")
 
-# 5. Actions (Duplicate/Delete)
+# 4. Duplicate
 st.sidebar.divider()
-with st.sidebar.expander("⚡ Actions"):
-    clone_name = st.text_input("Clone Name")
-    if st.button("Duplicate Network"):
+with st.sidebar.expander("⚡ Duplicate Network"):
+    clone_name = st.text_input("New Name")
+    if st.button("Duplicate Now"):
         if duplicate_network(pid, clone_name):
-            st.success("Cloned!")
+            st.success("Done!")
             st.rerun()
-    
-    st.write("")
-    if st.button("DELETE NETWORK", type="primary"):
-        run_query("DELETE FROM projects WHERE id=%s", (pid,))
-        st.rerun()
+
+# 5. DELETE (VISIBLE NOW)
+st.sidebar.subheader("Danger Zone")
+if st.sidebar.button("🗑️ DELETE CURRENT NETWORK", type="primary"):
+    run_query("DELETE FROM projects WHERE id=%s", (pid,))
+    st.rerun()
 
 # --- MAIN TABS ---
 st.title(f"🐇 {selected_project}")
@@ -219,13 +197,14 @@ with tabs[1]:
     st.subheader("Switches")
     sw_df = get_df("SELECT * FROM switches WHERE project_id=%s ORDER BY name", (pid,))
     
-    # Display Logic
-    disp_sw = sw_df.copy()
-    if not disp_sw.empty and 'metadata' in disp_sw.columns:
-        meta_df = pd.json_normalize(disp_sw['metadata'])
-        disp_sw = disp_sw.drop(columns=['metadata']).join(meta_df)
-    st.dataframe(disp_sw, use_container_width=True)
+    # Show Data
+    disp = sw_df.copy()
+    if not disp.empty and 'metadata' in disp.columns:
+        meta = pd.json_normalize(disp['metadata'])
+        disp = disp.drop(columns=['metadata']).join(meta)
+    st.dataframe(disp, use_container_width=True)
 
+    # Add/Edit Form
     with st.form("sw_form"):
         st.write("### Add / Edit Switch")
         c1, c2, c3 = st.columns(3)
@@ -236,13 +215,12 @@ with tabs[1]:
         s_role = c4.selectbox("Role", ["Grandmaster", "Boundary", "Slave"])
         s_clk = c5.text_input("Clock Source")
 
-        # Dynamic Inputs
+        # Custom Fields
         meta_vals = {}
         if "switch" in current_schema and current_schema["switch"]:
             st.write("#### Custom Fields")
             cols = st.columns(3)
             for i, f in enumerate(current_schema["switch"]):
-                # Pre-fill logic is complex, simpler to just overwrite for now
                 meta_vals[f] = cols[i%3].text_input(f)
 
         if st.form_submit_button("Save Switch"):
@@ -250,22 +228,22 @@ with tabs[1]:
                 meta_json = json.dumps(meta_vals)
                 exists = not sw_df[sw_df['name'] == s_name].empty
                 if exists:
-                    # Update (Merge metadata would be better, but overwrite is safer for now)
-                    ok, _ = run_query("UPDATE switches SET ip_address=%s, mac=%s, role=%s, clock_source=%s, metadata=%s WHERE project_id=%s AND name=%s", 
-                                      (s_ip, s_mac, s_role, s_clk, meta_json, pid, s_name))
-                    if ok: st.success("Updated!")
+                    run_query("UPDATE switches SET ip_address=%s, mac=%s, role=%s, clock_source=%s, metadata=%s WHERE project_id=%s AND name=%s", 
+                                (s_ip, s_mac, s_role, s_clk, meta_json, pid, s_name))
+                    st.success("Updated!")
                 else:
-                    ok, _ = run_query("INSERT INTO switches (project_id, name, ip_address, mac, role, clock_source, metadata) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
-                                      (pid, s_name, s_ip, s_mac, s_role, s_clk, meta_json))
-                    if ok: st.success("Created!")
-                    else: st.error("Error: Check if name is duplicate.")
+                    if run_query("INSERT INTO switches (project_id, name, ip_address, mac, role, clock_source, metadata) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
+                                (pid, s_name, s_ip, s_mac, s_role, s_clk, meta_json))[0]:
+                        st.success("Created!")
+                    else:
+                        st.error("Name duplicate.")
                 st.rerun()
 
     if not sw_df.empty:
         with st.expander("Delete Switch"):
-            to_del = st.selectbox("Select Switch", sw_df['name'])
-            if st.button("Confirm Delete"):
-                run_query("DELETE FROM switches WHERE project_id=%s AND name=%s", (pid, to_del))
+            del_s = st.selectbox("Select", sw_df['name'])
+            if st.button("Delete Switch"):
+                run_query("DELETE FROM switches WHERE project_id=%s AND name=%s", (pid, del_s))
                 st.rerun()
 
 # --- TAB 2: SFPs ---
@@ -304,11 +282,18 @@ with tabs[2]:
                 if exists:
                     run_query("UPDATE sfps SET channel=%s, wavelength=%s, alpha=%s, delta_tx=%s, delta_rx=%s, metadata=%s WHERE project_id=%s AND serial=%s",
                               (ch, wv, al, dtx, drx, meta_json, pid, sn))
-                    st.success("Updated!")
+                    st.success("Updated")
                 else:
                     run_query("INSERT INTO sfps (project_id, serial, channel, wavelength, alpha, delta_tx, delta_rx, metadata) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                               (pid, sn, ch, wv, al, dtx, drx, meta_json))
-                    st.success("Created!")
+                    st.success("Created")
+                st.rerun()
+    
+    if not sfp_df.empty:
+        with st.expander("Delete SFP"):
+            del_s = st.selectbox("Select SFP", sfp_df['serial'])
+            if st.button("Delete SFP"):
+                run_query("DELETE FROM sfps WHERE project_id=%s AND serial=%s", (pid, del_s))
                 st.rerun()
 
 # --- TAB 3: CONNECTIONS ---
