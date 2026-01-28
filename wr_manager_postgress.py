@@ -29,15 +29,21 @@ def init_db():
     with conn.cursor() as cur:
         # Tables
         cur.execute("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, name TEXT UNIQUE)")
+        
+        # 1. Switches (Added remarks, jitter_type)
         cur.execute("""CREATE TABLE IF NOT EXISTS switches (
             id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id), 
             name TEXT UNIQUE, role TEXT, ip_address TEXT, mac TEXT, 
-            clock_source TEXT)""")
+            clock_source TEXT, jitter_type TEXT, remarks TEXT)""")
+        
+        # 2. SFPs
         cur.execute("""CREATE TABLE IF NOT EXISTS sfps (
             id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id),
             serial TEXT UNIQUE, wavelength TEXT, channel TEXT, 
             alpha FLOAT DEFAULT 0, delta_tx FLOAT DEFAULT 0, delta_rx FLOAT DEFAULT 0, 
             remarks TEXT)""")
+        
+        # 3. Ports
         cur.execute("""CREATE TABLE IF NOT EXISTS ports (
             id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id),
             switch_id INTEGER REFERENCES switches(id), port_num INTEGER, 
@@ -47,16 +53,19 @@ def init_db():
             port_delta_tx FLOAT DEFAULT 0, port_delta_rx FLOAT DEFAULT 0,
             vlan INTEGER)""")
         
-        # Migrations
+        # Migrations (Auto-update existing DB)
         cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS clock_source TEXT")
+        cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS jitter_type TEXT") # <--- NEW
+        cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS remarks TEXT")     # <--- NEW
+        
         cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS delta_tx FLOAT DEFAULT 0")
         cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS delta_rx FLOAT DEFAULT 0")
         cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS remarks TEXT")
+        
         cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS remote_sfp_id INTEGER")
         cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS port_delta_tx FLOAT DEFAULT 0")
         cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS port_delta_rx FLOAT DEFAULT 0")
-        cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS vlan INTEGER") # <--- NEW
-    # No conn.commit() needed because autocommit=True
+        cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS vlan INTEGER")
 
 # --- APP SETUP ---
 st.set_page_config(layout="wide", page_title="White Rabbit Manager")
@@ -97,7 +106,7 @@ with st.sidebar.expander("❌ Delete Project"):
 st.title(f"🐇 {selected_project} Dashboard")
 tabs = st.tabs(["🗺️ Map", "🖥️ Switches", "🔌 SFPs", "⚙️ Connections", "💾 Backup", "📐 Calc"])
 
-# --- TAB 1: SWITCHES ---
+# --- TAB 1: SWITCHES (UPDATED) ---
 with tabs[1]:
     st.subheader("Switches")
     df_sw = get_df("SELECT * FROM switches WHERE project_id=%s ORDER BY name", (p_id,))
@@ -109,16 +118,27 @@ with tabs[1]:
         sw_name = c1.text_input("Name", placeholder="e.g. WRS-1")
         sw_ip = c2.text_input("IP")
         sw_mac = c3.text_input("MAC")
-        c4, c5 = st.columns(2)
+        
+        c4, c5, c6 = st.columns(3)
         sw_role = c4.selectbox("Role", ["Grandmaster", "Boundary", "Slave", "Timescale Slave"])
         sw_clk = c5.text_input("Clock Source")
+        sw_jit = c6.selectbox("Jitter Type", ["Normal", "Low Jitter"]) # <--- NEW
+        
+        c7 = st.columns(1)[0]
+        sw_rem = c7.text_input("Remarks") # <--- NEW
 
         if st.form_submit_button("Save Switch"):
             if sw_name:
-                run_query("""INSERT INTO switches (project_id, name, ip_address, mac, role, clock_source) 
-                             VALUES (%s, %s, %s, %s, %s, %s) 
-                             ON CONFLICT (name) DO UPDATE SET ip_address=EXCLUDED.ip_address, mac=EXCLUDED.mac, role=EXCLUDED.role, clock_source=EXCLUDED.clock_source""", 
-                             (p_id, sw_name, sw_ip, sw_mac, sw_role, sw_clk))
+                run_query("""INSERT INTO switches (project_id, name, ip_address, mac, role, clock_source, jitter_type, remarks) 
+                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
+                             ON CONFLICT (name) DO UPDATE SET 
+                                ip_address=EXCLUDED.ip_address, 
+                                mac=EXCLUDED.mac, 
+                                role=EXCLUDED.role, 
+                                clock_source=EXCLUDED.clock_source,
+                                jitter_type=EXCLUDED.jitter_type,
+                                remarks=EXCLUDED.remarks""", 
+                             (p_id, sw_name, sw_ip, sw_mac, sw_role, sw_clk, sw_jit, sw_rem))
                 st.rerun()
 
     with st.expander("🗑️ Delete Switch"):
@@ -166,7 +186,7 @@ with tabs[2]:
                 run_query("DELETE FROM sfps WHERE id=%s", (sid,))
                 st.rerun()
 
-# --- TAB 3: CONNECTIONS (ADDED VLAN) ---
+# --- TAB 3: CONNECTIONS ---
 with tabs[3]:
     st.subheader("Connections")
     df_p = get_df(f"""
@@ -204,7 +224,7 @@ with tabs[3]:
             cd1, cd2, cd3 = st.columns(3)
             p_dtx = cd1.number_input("Port Delta Tx (ns)", 0.0, format="%.4f")
             p_drx = cd2.number_input("Port Delta Rx (ns)", 0.0, format="%.4f")
-            p_vlan = cd3.number_input("VLAN (0 = None)", 0, 4096, 0) # <--- NEW
+            p_vlan = cd3.number_input("VLAN (0 = None)", 0, 4096, 0)
 
             st.divider()
             c4, c5, c6 = st.columns(3)
@@ -233,7 +253,6 @@ with tabs[3]:
             sel = st.selectbox("Select Link", lbls)
             sel_id = int(sel.split(":")[0].replace("ID ", ""))
             
-            # Fetch existing VLAN to pre-populate
             current_vlan = df_p[df_p['id'] == sel_id]['vlan'].values[0]
             current_vlan = int(current_vlan) if pd.notna(current_vlan) else 0
 
@@ -242,7 +261,7 @@ with tabs[3]:
                 ce1, ce2, ce3 = st.columns(3)
                 n_p_dtx = ce1.number_input("Update Port Delta Tx", 0.0, format="%.4f")
                 n_p_drx = ce2.number_input("Update Port Delta Rx", 0.0, format="%.4f")
-                n_vlan = ce3.number_input("Update VLAN", 0, 4096, current_vlan) # <--- NEW
+                n_vlan = ce3.number_input("Update VLAN", 0, 4096, current_vlan)
                 
                 n_lsfp = st.selectbox("Update Local SFP", sfp_opts)
                 
@@ -280,9 +299,10 @@ with tabs[0]:
         dot = Digraph(format='pdf')
         dot.attr(rankdir='LR')
         for _, s in df_sw.iterrows():
-            dot.node(str(s['id']), f"{s['name']}\n{s['role']}\n{s['ip_address']}")
+            # Added jitter type to the map node label for quick visibility
+            jit_lbl = f" ({s['jitter_type']})" if s['jitter_type'] else ""
+            dot.node(str(s['id']), f"{s['name']}{jit_lbl}\n{s['role']}\n{s['ip_address']}")
         for _, l in links.iterrows():
-            # Add VLAN info to the map edge label if it exists
             vlan_txt = f"\nVLAN: {int(l['vlan'])}" if pd.notna(l['vlan']) else ""
             dot.edge(str(l['switch_id']), str(l['connected_to_id']), label=f"P{l['port_num']}:P{l['connected_port_num']}{vlan_txt}")
         st.graphviz_chart(dot)
