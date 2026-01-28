@@ -11,39 +11,55 @@ def get_db_connection():
     """Establishes a persistent connection to the database."""
     return psycopg.connect(st.secrets["DB_URI"], autocommit=True)
 
-conn = get_db_connection()
+try:
+    conn = get_db_connection()
+except Exception as e:
+    st.error("❌ Connection failed. Please check your DB_URI in secrets.")
+    st.stop()
 
 def run_query(query, params=None):
-    """Helper to run queries without re-opening connections constantly."""
-    with conn.cursor() as cur:
-        cur.execute(query, params)
-        if query.strip().upper().startswith("SELECT"):
-            return cur.fetchall(), cur.description
+    """Helper to run queries with error handling for schema changes."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            if query.strip().upper().startswith("SELECT"):
+                return cur.fetchall(), cur.description
+    except psycopg.errors.FeatureNotSupported:
+        # Handles the 'cached plan' error by forcing a reload next time
+        st.cache_resource.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"Database Error: {e}")
     return None, None
 
 def get_df(query, params=None):
     """Helper to get a Pandas DataFrame efficiently."""
-    return pd.read_sql(query, conn, params=params)
+    try:
+        return pd.read_sql(query, conn, params=params)
+    except Exception:
+        # If schema changed, read_sql might fail. Clear cache and retry.
+        st.cache_resource.clear()
+        return pd.DataFrame()
 
 def init_db():
     with conn.cursor() as cur:
-        # Tables
+        # 1. Projects
         cur.execute("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, name TEXT UNIQUE)")
         
-        # 1. Switches (Added remarks, jitter_type)
+        # 2. Switches
         cur.execute("""CREATE TABLE IF NOT EXISTS switches (
             id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id), 
             name TEXT UNIQUE, role TEXT, ip_address TEXT, mac TEXT, 
             clock_source TEXT, jitter_type TEXT, remarks TEXT)""")
         
-        # 2. SFPs
+        # 3. SFPs
         cur.execute("""CREATE TABLE IF NOT EXISTS sfps (
             id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id),
             serial TEXT UNIQUE, wavelength TEXT, channel TEXT, 
             alpha FLOAT DEFAULT 0, delta_tx FLOAT DEFAULT 0, delta_rx FLOAT DEFAULT 0, 
             remarks TEXT)""")
         
-        # 3. Ports
+        # 4. Ports
         cur.execute("""CREATE TABLE IF NOT EXISTS ports (
             id SERIAL PRIMARY KEY, project_id INTEGER REFERENCES projects(id),
             switch_id INTEGER REFERENCES switches(id), port_num INTEGER, 
@@ -53,15 +69,13 @@ def init_db():
             port_delta_tx FLOAT DEFAULT 0, port_delta_rx FLOAT DEFAULT 0,
             vlan INTEGER)""")
         
-        # Migrations (Auto-update existing DB)
+        # Migrations
         cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS clock_source TEXT")
-        cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS jitter_type TEXT") # <--- NEW
-        cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS remarks TEXT")     # <--- NEW
-        
+        cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS jitter_type TEXT")
+        cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS remarks TEXT")
         cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS delta_tx FLOAT DEFAULT 0")
         cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS delta_rx FLOAT DEFAULT 0")
         cur.execute("ALTER TABLE sfps ADD COLUMN IF NOT EXISTS remarks TEXT")
-        
         cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS remote_sfp_id INTEGER")
         cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS port_delta_tx FLOAT DEFAULT 0")
         cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS port_delta_rx FLOAT DEFAULT 0")
@@ -74,39 +88,49 @@ init_db()
 # --- SIDEBAR ---
 st.sidebar.title("📂 Network Selector")
 
-# Fetch projects efficiently
+# 1. Fetch Projects
 all_projects = get_df("SELECT * FROM projects")
 
-if all_projects.empty:
-    st.sidebar.warning("No networks found.")
-    new_p = st.sidebar.text_input("New Network Name")
-    if st.sidebar.button("Create Network"):
-        run_query("INSERT INTO projects (name) VALUES (%s)", (new_p,))
-        st.rerun()
+# 2. Project Selection Logic
+selected_project = None
+p_id = None
+
+if not all_projects.empty:
+    selected_project = st.sidebar.selectbox("Active Network", all_projects['name'])
+    p_id = int(all_projects[all_projects['name'] == selected_project]['id'].values[0])
+else:
+    st.sidebar.warning("⚠️ No networks found. Create one below.")
+
+# 3. Create Project (ALWAYS VISIBLE NOW)
+with st.sidebar.expander("➕ Create New Network", expanded=all_projects.empty):
+    new_p = st.text_input("Network Name")
+    if st.button("Create Network"):
+        if new_p:
+            run_query("INSERT INTO projects (name) VALUES (%s)", (new_p,))
+            st.rerun()
+
+# 4. Stop if no project is selected
+if p_id is None:
+    st.info("Please create or select a network to continue.")
     st.stop()
 
-selected_project = st.sidebar.selectbox("Active Network", all_projects['name'])
-# Cache project ID in session state to avoid re-querying it constantly
-if 'project_id' not in st.session_state or st.session_state.project_name != selected_project:
-    st.session_state.project_id = int(all_projects[all_projects['name'] == selected_project]['id'].values[0])
-    st.session_state.project_name = selected_project
-
-p_id = st.session_state.project_id
-
 st.sidebar.divider()
+
+# 5. Delete Project
 with st.sidebar.expander("❌ Delete Project"):
     if st.button("DELETE PROJECT"):
         run_query("DELETE FROM ports WHERE project_id=%s", (p_id,))
         run_query("DELETE FROM sfps WHERE project_id=%s", (p_id,))
         run_query("DELETE FROM switches WHERE project_id=%s", (p_id,))
         run_query("DELETE FROM projects WHERE id=%s", (p_id,))
+        st.cache_resource.clear() # Clear cache to refresh state immediately
         st.rerun()
 
-# --- TABS ---
+# --- MAIN UI ---
 st.title(f"🐇 {selected_project} Dashboard")
 tabs = st.tabs(["🗺️ Map", "🖥️ Switches", "🔌 SFPs", "⚙️ Connections", "💾 Backup", "📐 Calc"])
 
-# --- TAB 1: SWITCHES (UPDATED) ---
+# --- TAB 1: SWITCHES ---
 with tabs[1]:
     st.subheader("Switches")
     df_sw = get_df("SELECT * FROM switches WHERE project_id=%s ORDER BY name", (p_id,))
@@ -122,10 +146,10 @@ with tabs[1]:
         c4, c5, c6 = st.columns(3)
         sw_role = c4.selectbox("Role", ["Grandmaster", "Boundary", "Slave", "Timescale Slave"])
         sw_clk = c5.text_input("Clock Source")
-        sw_jit = c6.selectbox("Jitter Type", ["Normal", "Low Jitter"]) # <--- NEW
+        sw_jit = c6.selectbox("Jitter Type", ["Normal", "Low Jitter"]) 
         
         c7 = st.columns(1)[0]
-        sw_rem = c7.text_input("Remarks") # <--- NEW
+        sw_rem = c7.text_input("Remarks")
 
         if st.form_submit_button("Save Switch"):
             if sw_name:
@@ -207,7 +231,6 @@ with tabs[3]:
 
     mode = st.radio("Action", ["Add New Link", "Edit Existing Link"], horizontal=True)
 
-    # Pre-calculate lists to avoid lag in rendering
     sw_opts = df_sw['name'].tolist() if not df_sw.empty else []
     sfp_opts = ["None"] + df_sfp['serial'].tolist() if not df_sfp.empty else ["None"]
 
@@ -253,8 +276,12 @@ with tabs[3]:
             sel = st.selectbox("Select Link", lbls)
             sel_id = int(sel.split(":")[0].replace("ID ", ""))
             
-            current_vlan = df_p[df_p['id'] == sel_id]['vlan'].values[0]
-            current_vlan = int(current_vlan) if pd.notna(current_vlan) else 0
+            # Safe access to VLAN
+            if not df_p[df_p['id'] == sel_id].empty:
+                current_vlan = df_p[df_p['id'] == sel_id]['vlan'].values[0]
+                current_vlan = int(current_vlan) if pd.notna(current_vlan) else 0
+            else:
+                current_vlan = 0
 
             with st.form("edit_link"):
                 st.write(f"Editing {sel}")
@@ -299,7 +326,6 @@ with tabs[0]:
         dot = Digraph(format='pdf')
         dot.attr(rankdir='LR')
         for _, s in df_sw.iterrows():
-            # Added jitter type to the map node label for quick visibility
             jit_lbl = f" ({s['jitter_type']})" if s['jitter_type'] else ""
             dot.node(str(s['id']), f"{s['name']}{jit_lbl}\n{s['role']}\n{s['ip_address']}")
         for _, l in links.iterrows():
