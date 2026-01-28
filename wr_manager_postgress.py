@@ -44,7 +44,8 @@ def init_db():
             sfp_id INTEGER REFERENCES sfps(id),
             remote_sfp_id INTEGER REFERENCES sfps(id),
             connected_to_id INTEGER REFERENCES switches(id), connected_port_num INTEGER,
-            port_delta_tx FLOAT DEFAULT 0, port_delta_rx FLOAT DEFAULT 0)""")
+            port_delta_tx FLOAT DEFAULT 0, port_delta_rx FLOAT DEFAULT 0,
+            vlan INTEGER)""")
         
         # Migrations
         cur.execute("ALTER TABLE switches ADD COLUMN IF NOT EXISTS clock_source TEXT")
@@ -54,6 +55,7 @@ def init_db():
         cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS remote_sfp_id INTEGER")
         cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS port_delta_tx FLOAT DEFAULT 0")
         cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS port_delta_rx FLOAT DEFAULT 0")
+        cur.execute("ALTER TABLE ports ADD COLUMN IF NOT EXISTS vlan INTEGER") # <--- NEW
     # No conn.commit() needed because autocommit=True
 
 # --- APP SETUP ---
@@ -164,7 +166,7 @@ with tabs[2]:
                 run_query("DELETE FROM sfps WHERE id=%s", (sid,))
                 st.rerun()
 
-# --- TAB 3: CONNECTIONS ---
+# --- TAB 3: CONNECTIONS (ADDED VLAN) ---
 with tabs[3]:
     st.subheader("Connections")
     df_p = get_df(f"""
@@ -172,7 +174,7 @@ with tabs[3]:
                 sfp1.serial as l_sfp,
                 s2.name as remote, p.connected_port_num,
                 sfp2.serial as r_sfp,
-                p.port_delta_tx, p.port_delta_rx
+                p.port_delta_tx, p.port_delta_rx, p.vlan
         FROM ports p 
         JOIN switches s1 ON p.switch_id=s1.id 
         LEFT JOIN switches s2 ON p.connected_to_id=s2.id 
@@ -199,9 +201,10 @@ with tabs[3]:
             l_sfp = c1.selectbox("Local SFP", sfp_opts)
             
             st.write("**Local Port Electronics Calibration**")
-            cd1, cd2 = st.columns(2)
+            cd1, cd2, cd3 = st.columns(3)
             p_dtx = cd1.number_input("Port Delta Tx (ns)", 0.0, format="%.4f")
             p_drx = cd2.number_input("Port Delta Rx (ns)", 0.0, format="%.4f")
+            p_vlan = cd3.number_input("VLAN (0 = None)", 0, 4096, 0) # <--- NEW
 
             st.divider()
             c4, c5, c6 = st.columns(3)
@@ -216,10 +219,12 @@ with tabs[3]:
                     sid1 = int(df_sfp[df_sfp['serial']==l_sfp]['id'].values[0]) if l_sfp != "None" else None
                     sid2 = int(df_sfp[df_sfp['serial']==r_sfp]['id'].values[0]) if r_sfp != "None" else None
                     
+                    vlan_val = int(p_vlan) if p_vlan > 0 else None
+                    
                     run_query("""INSERT INTO ports 
-                        (project_id, switch_id, port_num, sfp_id, remote_sfp_id, connected_to_id, connected_port_num, port_delta_tx, port_delta_rx) 
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""", 
-                        (p_id, lid, l_p, sid1, sid2, rid, r_p, p_dtx, p_drx))
+                        (project_id, switch_id, port_num, sfp_id, remote_sfp_id, connected_to_id, connected_port_num, port_delta_tx, port_delta_rx, vlan) 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""", 
+                        (p_id, lid, l_p, sid1, sid2, rid, r_p, p_dtx, p_drx, vlan_val))
                     st.rerun()
 
     elif mode == "Edit Existing Link":
@@ -228,18 +233,25 @@ with tabs[3]:
             sel = st.selectbox("Select Link", lbls)
             sel_id = int(sel.split(":")[0].replace("ID ", ""))
             
+            # Fetch existing VLAN to pre-populate
+            current_vlan = df_p[df_p['id'] == sel_id]['vlan'].values[0]
+            current_vlan = int(current_vlan) if pd.notna(current_vlan) else 0
+
             with st.form("edit_link"):
                 st.write(f"Editing {sel}")
-                ce1, ce2 = st.columns(2)
+                ce1, ce2, ce3 = st.columns(3)
                 n_p_dtx = ce1.number_input("Update Port Delta Tx", 0.0, format="%.4f")
                 n_p_drx = ce2.number_input("Update Port Delta Rx", 0.0, format="%.4f")
+                n_vlan = ce3.number_input("Update VLAN", 0, 4096, current_vlan) # <--- NEW
                 
                 n_lsfp = st.selectbox("Update Local SFP", sfp_opts)
                 
                 if st.form_submit_button("Update Link"):
                     sid1 = int(df_sfp[df_sfp['serial']==n_lsfp]['id'].values[0]) if n_lsfp != "None" else None
-                    run_query("UPDATE ports SET port_delta_tx=%s, port_delta_rx=%s, sfp_id=%s WHERE id=%s", 
-                                 (n_p_dtx, n_p_drx, sid1, sel_id))
+                    vlan_val = int(n_vlan) if n_vlan > 0 else None
+                    
+                    run_query("UPDATE ports SET port_delta_tx=%s, port_delta_rx=%s, vlan=%s, sfp_id=%s WHERE id=%s", 
+                                 (n_p_dtx, n_p_drx, vlan_val, sid1, sel_id))
                     st.rerun()
 
     with st.expander("🗑️ Delete Link"):
@@ -263,14 +275,16 @@ with tabs[4]:
 
 # --- TAB 0: MAP ---
 with tabs[0]:
-    links = get_df("SELECT switch_id, connected_to_id, port_num, connected_port_num FROM ports WHERE project_id=%s AND connected_to_id IS NOT NULL", (p_id,))
+    links = get_df("SELECT switch_id, connected_to_id, port_num, connected_port_num, vlan FROM ports WHERE project_id=%s AND connected_to_id IS NOT NULL", (p_id,))
     if not df_sw.empty:
         dot = Digraph(format='pdf')
         dot.attr(rankdir='LR')
         for _, s in df_sw.iterrows():
             dot.node(str(s['id']), f"{s['name']}\n{s['role']}\n{s['ip_address']}")
         for _, l in links.iterrows():
-            dot.edge(str(l['switch_id']), str(l['connected_to_id']), label=f"P{l['port_num']}:P{l['connected_port_num']}")
+            # Add VLAN info to the map edge label if it exists
+            vlan_txt = f"\nVLAN: {int(l['vlan'])}" if pd.notna(l['vlan']) else ""
+            dot.edge(str(l['switch_id']), str(l['connected_to_id']), label=f"P{l['port_num']}:P{l['connected_port_num']}{vlan_txt}")
         st.graphviz_chart(dot)
         try: st.download_button("📥 PDF", dot.pipe(), "topology.pdf")
         except: pass
